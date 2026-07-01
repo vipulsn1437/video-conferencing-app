@@ -2,12 +2,12 @@ require('dotenv').config({ path: '.env.local' });
 const express = require('express');
 const cors = require('cors');
 const { AccessToken, RoomServiceClient } = require('livekit-server-sdk');
+const multer = require('multer');
 
-// ── Startup checks ────────────────────────────────────────────────────────────
-const LIVEKIT_API_KEY    = process.env.LIVEKIT_API_KEY    || 'devkey';
+const LIVEKIT_API_KEY    = process.env.LIVEKIT_API_KEY || 'devkey';
 const LIVEKIT_API_SECRET = process.env.LIVEKIT_API_SECRET || 'secret';
-const LIVEKIT_URL        = process.env.LIVEKIT_URL        || 'ws://localhost:7880';
-const GROQ_KEY           = process.env.GROQ_KEY;
+const LIVEKIT_URL        = process.env.LIVEKIT_URL || 'ws://localhost:7880';
+const GROQ_KEY           = process.env.GROQ_API_KEY;
 const PORT               = process.env.PORT || 5000;
 const CLIENT_URL         = process.env.CLIENT_URL || 'http://localhost:3000';
 const GROQ_MODEL         = 'llama-3.3-70b-versatile';
@@ -228,6 +228,70 @@ ${transcript}`,
     res.json({ summary });
   } catch (err) {
     console.error('Summarize error:', err);
+    res.status(500).json({ error: 'Internal server error.' });
+  }
+});
+
+// ── /transcribe ───────────────────────────────────────────────────────────────
+const transcribeUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 25 * 1024 * 1024 }, // 25 MB (Groq Whisper limit)
+});
+
+// Simple per-IP rate limiter for transcribe
+const transcribeHits = new Map();
+function transcribeRateLimit(req, res, next) {
+  const ip = req.ip;
+  const now = Date.now();
+  const windowMs = 60_000;
+  const max = 40;
+  const entry = transcribeHits.get(ip) || { count: 0, start: now };
+  if (now - entry.start > windowMs) { entry.count = 0; entry.start = now; }
+  entry.count++;
+  transcribeHits.set(ip, entry);
+  if (entry.count > max) {
+    return res.status(429).json({ error: 'Too many transcribe requests.' });
+  }
+  next();
+}
+
+app.post('/transcribe', transcribeRateLimit, transcribeUpload.single('audio'), async (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: 'No audio file uploaded.' });
+  }
+  if (!GROQ_KEY) {
+    return res.status(503).json({ error: 'GROQ_KEY not configured on server.' });
+  }
+
+  try {
+    const form = new FormData();
+    const blob = new Blob(
+      [req.file.buffer],
+      { type: req.file.mimetype || 'audio/webm' }
+    );
+    form.append('file', blob, req.file.originalname || 'chunk.webm');
+    form.append('model', 'whisper-large-v3-turbo');
+    form.append('response_format', 'json');
+    form.append('temperature', '0');
+    if (req.body.language) form.append('language', req.body.language);
+
+    const response = await fetch(
+      'https://api.groq.com/openai/v1/audio/transcriptions',
+      {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${GROQ_KEY}` },
+        body: form,
+      }
+    );
+
+    const data = await response.json();
+    if (!response.ok) {
+      console.error('Groq Whisper error:', data);
+      return res.status(502).json({ error: data.error?.message || 'Transcription failed.' });
+    }
+    res.json({ text: (data.text || '').trim() });
+  } catch (err) {
+    console.error('Transcribe error:', err);
     res.status(500).json({ error: 'Internal server error.' });
   }
 });

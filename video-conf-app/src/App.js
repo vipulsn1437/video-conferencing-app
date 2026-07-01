@@ -2,12 +2,11 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { LiveKitRoom, VideoConference } from '@livekit/components-react';
 import '@livekit/components-styles';
 import SidePanel from './components/SidePanel';
-import MicDetector from './components/MicDetector';
 import ParticipantCount from './components/ParticipantCount';
 import ParticipantList from './components/ParticipantList';
 import './App.css';
-import useTranscript from './useTranscript';
 import useSharedTranscript from './useSharedTranscript';
+import TranscriptionRecorder from './components/TranscriptionRecorder';
 import { onAuthStateChanged, signOut } from 'firebase/auth';
 import { auth } from './firebase';
 import AuthScreen from './components/AuthScreen';
@@ -35,7 +34,6 @@ function App() {
   const [meetingStartTime, setMeetingStartTime] = useState(null);
   const [transcriptLines, setTranscriptLines]   = useState([]);
   const [interimText, setInterimText]           = useState('');
-  const [isMicOn, setIsMicOn]                   = useState(false);
   const [summary, setSummary]                   = useState('');
   const [isGenerating, setIsGenerating]         = useState(false);
   const [isListening, setIsListening]           = useState(true);
@@ -57,10 +55,10 @@ function App() {
   }, []);
 
   useEffect(() => {
-  if (user?.displayName && !username) {
-    setUsername(user.displayName);
-  }
-}, [user, username]);
+    if (user?.displayName && !username) {
+      setUsername(user.displayName);
+    }
+  }, [user, username]);
 
   useEffect(() => {
     if (user === null) {
@@ -75,7 +73,6 @@ function App() {
       setActiveTab('transcript');
       setInterimText('');
       setJoinError('');
-      setIsMicOn(false);
       setParticipantCount(0);
       setParticipants([]);
       setIsHost(false);
@@ -101,12 +98,10 @@ function App() {
     useCallback((startMs) => setMeetingStartTime(startMs), [])
   );
 
-  // ── Local speech recognition ──────────────────────────────────────────────
-  useTranscript(
-    username,
-    useCallback((line) => saveTranscriptLine(line), [saveTranscriptLine]),
-    useCallback((interim) => setInterimText(interim), []),
-    isMicOn && isListening
+  // ── Server-side transcription (Groq Whisper via backend) ──────────────────
+  const handleTranscriptLine = useCallback(
+    (line) => saveTranscriptLine(line),
+    [saveTranscriptLine]
   );
 
   // ── Meeting timer (synced to shared startedAt) ────────────────────────────
@@ -276,7 +271,6 @@ function App() {
     setMeetingStartTime(null);
     setActiveTab('transcript');
     setInterimText('');
-    setIsMicOn(false);
     setParticipantCount(0);
     setParticipants([]);
     setIsHost(false);
@@ -428,9 +422,16 @@ function App() {
           >
             <VideoConference />
             <AvatarPlaceholder />
-            <MicDetector onMicChange={setIsMicOn} />
             <ParticipantCount onCount={setParticipantCount} />
             <ParticipantList onParticipants={setParticipants} />
+            <TranscriptionRecorder
+              isActive={isListening}
+              username={username}
+              serverUrl={SERVER}
+              onNewLine={handleTranscriptLine}
+              chunkDurationMs={5000}
+              language="en"
+            />
           </LiveKitRoom>
         </div>
         <SidePanel
