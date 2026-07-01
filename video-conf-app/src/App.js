@@ -57,8 +57,10 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (user?.displayName && !username) setUsername(user.displayName);
-  }, [user]);
+  if (user?.displayName && !username) {
+    setUsername(user.displayName);
+  }
+}, [user, username]);
 
   useEffect(() => {
     if (user === null) {

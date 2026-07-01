@@ -202,7 +202,7 @@ const useTranscript = (username, onNewLine, onInterim, isActive) => {
       isMounted.current = false;
       stop();
     };
-  }, [isActive]);
+  }, [isActive, clearInterim, clearTimers]);
 };
 
 export default useTranscript;
