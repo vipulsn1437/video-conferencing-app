@@ -255,7 +255,7 @@ app.post('/transcribe', transcribeRateLimit, upload.single('audio'), async (req,
       console.log(`[transcribe] noSpeechProb=${avgNoSpeechProb.toFixed(2)} logProb=${avgLogProb.toFixed(2)} text="${rawText}"`);
 
       // Loosened from 0.45/-0.7 — was rejecting real speech
-    if (avgNoSpeechProb > 0.6 || avgLogProb < -1.0) {
+    if (avgNoSpeechProb > 0.5 || avgLogProb < -1.0) {
         return res.json({ text: '' });
       }
     } else if (!rawText) {

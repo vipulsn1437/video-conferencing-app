@@ -6,7 +6,7 @@ const LANE_OFFSET_MS = CHUNK_MS / 2;
 const ENABLE_DUAL_LANE = true;
 const MIN_BLOB_BYTES = 3000;
 const SILENCE_RMS_THRESHOLD = 0.011;
-const MIN_VOICED_RATIO = 0.15;
+const MIN_VOICED_RATIO = 0.18;
 const MAX_OVERLAP_WORDS = 12;
 const DEBUG_AUDIO = true; // set false once tuned — logs voiced ratio per chunk
 
