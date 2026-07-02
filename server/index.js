@@ -252,8 +252,10 @@ app.post('/transcribe', transcribeRateLimit, upload.single('audio'), async (req,
       const avgLogProb =
         segments.reduce((sum, s) => sum + (s.avg_logprob ?? 0), 0) / segments.length;
 
-      // Tightened from 0.6 / -1.0 — ambient/unclear audio needs to be rejected harder
-      if (avgNoSpeechProb > 0.45 || avgLogProb < -0.7) {
+      console.log(`[transcribe] noSpeechProb=${avgNoSpeechProb.toFixed(2)} logProb=${avgLogProb.toFixed(2)} text="${rawText}"`);
+
+      // Loosened from 0.45/-0.7 — was rejecting real speech
+      if (avgNoSpeechProb > 0.6 || avgLogProb < -1.0) {
         return res.json({ text: '' });
       }
     } else if (!rawText) {

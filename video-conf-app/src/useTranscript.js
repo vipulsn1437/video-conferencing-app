@@ -5,9 +5,10 @@ const CHUNK_MS = 6000;
 const LANE_OFFSET_MS = CHUNK_MS / 2;
 const ENABLE_DUAL_LANE = true;
 const MIN_BLOB_BYTES = 3000;
-const SILENCE_RMS_THRESHOLD = 0.02;   // raised from 0.012 — less sensitive to faint ambient audio
-const MIN_VOICED_RATIO = 0.35;        // raised from 0.15 — requires sustained speech, not brief noise
+const SILENCE_RMS_THRESHOLD = 0.015;
+const MIN_VOICED_RATIO = 0.2;
 const MAX_OVERLAP_WORDS = 12;
+const DEBUG_AUDIO = true; // set false once tuned — logs voiced ratio per chunk
 
 // ── Text post-processor ───────────────────────────────────────────────────────
 function cleanText(text) {
@@ -41,7 +42,6 @@ function isTooSimilar(a, b) {
   return false;
 }
 
-// ── Known junk: Whisper stock hallucinations + observed UI/ambient leakage ────
 const HALLUCINATIONS = new Set([
   'thank you', 'thanks for watching', 'bye', 'you', 'thank you for watching',
   'thanks for watching!', 'please subscribe', 'subscribe', 'i', 'okay', 'ok',
@@ -52,7 +52,6 @@ const HALLUCINATIONS = new Set([
   'video conferencing', 'and summaries', 'please read the description',
 ]);
 
-// Reject if the text is mostly weather-report vocabulary (ambient audio pickup)
 const WEATHER_WORDS = ['weather', 'humidity', 'thunderstorm', 'precipitation', 'celsius', 'clouds', 'winds', 'forecast'];
 function looksLikeWeatherReport(text) {
   const lower = text.toLowerCase();
@@ -171,7 +170,16 @@ const useTranscript = (username, onNewLine, onInterim, isActive) => {
     laneRmsBuffers.current[lane] = [];
     if (samples.length === 0) return true;
     const voicedCount = samples.filter(rms => rms > SILENCE_RMS_THRESHOLD).length;
-    return (voicedCount / samples.length) >= MIN_VOICED_RATIO;
+    const ratio = voicedCount / samples.length;
+    const maxRms = samples.length ? Math.max(...samples) : 0;
+
+    if (DEBUG_AUDIO) {
+      console.log(
+        `[audio ${lane}] voicedRatio=${ratio.toFixed(2)} (need ${MIN_VOICED_RATIO}) maxRms=${maxRms.toFixed(4)} → ${ratio >= MIN_VOICED_RATIO ? 'SEND' : 'SKIP'}`
+      );
+    }
+
+    return ratio >= MIN_VOICED_RATIO;
   }, []);
 
   const processQueue = useCallback(() => {
@@ -180,6 +188,8 @@ const useTranscript = (username, onNewLine, onInterim, isActive) => {
       const raw = pendingResultsRef.current.get(seq);
       pendingResultsRef.current.delete(seq);
       nextSeqToProcessRef.current += 1;
+
+      if (DEBUG_AUDIO) console.log(`[transcribe seq ${seq}] raw:`, JSON.stringify(raw));
 
       if (!raw || !raw.trim()) continue;
 
@@ -227,8 +237,6 @@ const useTranscript = (username, onNewLine, onInterim, isActive) => {
 
       const form = new FormData();
       form.append('audio', blob, `chunk.${ext}`);
-      // NOTE: previousText is intentionally no longer sent — it was leaking
-      // back into transcripts on unclear audio ("Previous words spoken" bug).
 
       const res = await fetch(`${SERVER}/transcribe`, { method: 'POST', body: form });
 
