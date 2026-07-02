@@ -12,6 +12,18 @@ import { onAuthStateChanged, signOut } from 'firebase/auth';
 import { auth } from './firebase';
 import AuthScreen from './components/AuthScreen';
 import AvatarPlaceholder from './components/AvatarPlaceholder';
+import { auth } from './firebase';
+
+async function authedFetch(url, options = {}) {
+  const token = await auth.currentUser?.getIdToken();
+  return fetch(url, {
+    ...options,
+    headers: {
+      ...(options.headers || {}),
+      Authorization: `Bearer ${token}`,
+    },
+  });
+}
 
 const SERVER = process.env.REACT_APP_SERVER_URL || 'http://localhost:5000';
 const LIVEKIT_URL = process.env.REACT_APP_LIVEKIT_URL || 'ws://localhost:7880';
@@ -147,9 +159,9 @@ function App() {
     setMeetingStartTime(null);
 
     try {
-      const res = await fetch(
-        `${SERVER}/token?username=${encodeURIComponent(trimmedName)}&room=${encodeURIComponent(roomName)}&create=${mode === 'create'}&photoURL=${encodeURIComponent(user?.photoURL || '')}`
-      );
+     const res = await authedFetch(
+  `${SERVER}/token?username=${encodeURIComponent(trimmedName)}&room=${encodeURIComponent(roomName)}&create=${mode === 'create'}&photoURL=${encodeURIComponent(user?.photoURL || '')}`
+);
       if (!res.ok) {
         const err = await res.json();
         throw new Error(err.error || 'Server error');
@@ -206,54 +218,64 @@ function App() {
   };
 
   // ── Host actions ──────────────────────────────────────────────────────────
-  const muteAllParticipants = useCallback(async () => {
-    try {
-      const res = await fetch(`${SERVER}/host/mute-all`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ room, requester: username }),
-      });
-      if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.error || 'Server error');
-      }
-    } catch (err) {
-      alert(`Error muting participants: ${err.message}`);
-    }
-  }, [room, username]);
+ const muteAllParticipants = useCallback(async () => {
+  try {
+    const res = await authedFetch(`${SERVER}/host/mute-all`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ room }),
+    });
 
-  const muteParticipant = useCallback(async (targetIdentity) => {
-    try {
-      const res = await fetch(`${SERVER}/host/mute-participant`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ room, requester: username, target: targetIdentity }),
-      });
-      if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.error || 'Server error');
-      }
-    } catch (err) {
-      alert(`Error muting participant: ${err.message}`);
+    if (!res.ok) {
+      const err = await res.json();
+      throw new Error(err.error || 'Server error');
     }
-  }, [room, username]);
+  } catch (err) {
+    alert(`Error muting participants: ${err.message}`);
+  }
+}, [room]);
 
-  const removeParticipant = useCallback(async (targetIdentity) => {
-    if (!window.confirm(`Remove ${targetIdentity} from the meeting?`)) return;
-    try {
-      const res = await fetch(`${SERVER}/host/remove-participant`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ room, requester: username, target: targetIdentity }),
-      });
-      if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.error || 'Server error');
-      }
-    } catch (err) {
-      alert(`Error removing participant: ${err.message}`);
+const muteParticipant = useCallback(async (targetIdentity) => {
+  try {
+    const res = await authedFetch(`${SERVER}/host/mute-participant`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        room,
+        target: targetIdentity,
+      }),
+    });
+
+    if (!res.ok) {
+      const err = await res.json();
+      throw new Error(err.error || 'Server error');
     }
-  }, [room, username]);
+  } catch (err) {
+    alert(`Error muting participant: ${err.message}`);
+  }
+}, [room]);
+
+const removeParticipant = useCallback(async (targetIdentity) => {
+  if (!window.confirm(`Remove ${targetIdentity} from the meeting?`)) return;
+
+  try {
+    const res = await authedFetch(`${SERVER}/host/remove-participant`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        room,
+        target: targetIdentity,
+      }),
+    });
+
+    if (!res.ok) {
+      const err = await res.json();
+      throw new Error(err.error || 'Server error');
+    }
+  } catch (err) {
+    alert(`Error removing participant: ${err.message}`);
+  }
+}, [room]);
 
   // ── Downloads ─────────────────────────────────────────────────────────────
   const downloadTranscript = useCallback(() => {

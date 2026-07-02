@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
 const { AccessToken, RoomServiceClient } = require('livekit-server-sdk');
+const admin = require('./firebaseAdmin');
 
 // ── Startup checks ────────────────────────────────────────────────────────────
 const LIVEKIT_API_KEY    = process.env.LIVEKIT_API_KEY    || 'devkey';
@@ -41,8 +42,28 @@ const upload = multer({
   limits: { fileSize: 15 * 1024 * 1024 }, // 15MB — plenty for a few seconds of audio
 });
 
-// ── Host tracking (in-memory: room -> host identity) ─────────────────────────
+// ── Host tracking (in-memory: room -> host UID) ───────────────────────────────
 const roomHosts = new Map();
+
+// ── Auth middleware: verifies Firebase ID token, sets req.uid ────────────────
+async function verifyAuth(req, res, next) {
+  const authHeader = req.headers.authorization || '';
+  const idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+
+  if (!idToken) {
+    return res.status(401).json({ error: 'Missing auth token.' });
+  }
+
+  try {
+    const decoded = await admin.auth().verifyIdToken(idToken);
+    req.uid = decoded.uid;
+    req.userEmail = decoded.email || null;
+    next();
+  } catch (err) {
+    console.error('Token verification failed:', err.message);
+    return res.status(401).json({ error: 'Invalid or expired token.' });
+  }
+}
 
 // ── Rate limiters (manual, no extra deps) ─────────────────────────────────────
 const summarizeHits = new Map();
@@ -83,24 +104,25 @@ function transcribeRateLimit(req, res, next) {
   next();
 }
 
-// ── Host-only guard ───────────────────────────────────────────────────────────
+// ── Host-only guard (checks verified UID, not client-supplied name) ──────────
 function requireHost(req, res, next) {
-  const { room, requester } = req.body;
-  if (!room || !requester) {
-    return res.status(400).json({ error: 'room and requester are required.' });
+  const { room } = req.body;
+  if (!room) {
+    return res.status(400).json({ error: 'room is required.' });
   }
-  if (roomHosts.get(room) !== requester) {
+  if (roomHosts.get(room) !== req.uid) {
     return res.status(403).json({ error: 'Only the host can do that.' });
   }
   next();
 }
 
 // ── /token ────────────────────────────────────────────────────────────────────
-app.get('/token', async (req, res) => {
+app.get('/token', verifyAuth, async (req, res) => {
   const username = req.query.username?.trim();
   const room     = req.query.room?.trim().replace(/[^a-zA-Z0-9_-]/g, '_');
   const create   = req.query.create === 'true';
   const photoURL = req.query.photoURL?.trim() || '';
+  const uid      = req.uid;
 
   if (!username || !room) {
     return res.status(400).json({ error: 'username and room are required.' });
@@ -125,13 +147,13 @@ app.get('/token', async (req, res) => {
   }
 
   if (create && !roomHosts.has(room)) {
-    roomHosts.set(room, username);
+    roomHosts.set(room, uid);
   }
-  const isHost = roomHosts.get(room) === username;
+  const isHost = roomHosts.get(room) === uid;
 
   try {
     const at = new AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, {
-      identity: username,
+      identity: uid,
       name: username,
       ttl: '2h',
       metadata: JSON.stringify({ photoURL, isHost }),
@@ -151,13 +173,14 @@ app.get('/token', async (req, res) => {
 });
 
 // ── /host/mute-all ────────────────────────────────────────────────────────────
-app.post('/host/mute-all', requireHost, async (req, res) => {
-  const { room, requester } = req.body;
+app.post('/host/mute-all', verifyAuth, requireHost, async (req, res) => {
+  const { room } = req.body;
+  const requesterUid = req.uid;
   try {
     const participants = await roomService.listParticipants(room);
     const results = await Promise.allSettled(
       participants
-        .filter(p => p.identity !== requester)
+        .filter(p => p.identity !== requesterUid)
         .flatMap(p =>
           (p.tracks || [])
             .filter(t => t.type === 'AUDIO' || t.type === 0)
@@ -173,7 +196,7 @@ app.post('/host/mute-all', requireHost, async (req, res) => {
 });
 
 // ── /host/mute-participant ────────────────────────────────────────────────────
-app.post('/host/mute-participant', requireHost, async (req, res) => {
+app.post('/host/mute-participant', verifyAuth, requireHost, async (req, res) => {
   const { room, target } = req.body;
   if (!target) return res.status(400).json({ error: 'target is required.' });
   try {
@@ -195,7 +218,7 @@ app.post('/host/mute-participant', requireHost, async (req, res) => {
 });
 
 // ── /host/remove-participant ──────────────────────────────────────────────────
-app.post('/host/remove-participant', requireHost, async (req, res) => {
+app.post('/host/remove-participant', verifyAuth, requireHost, async (req, res) => {
   const { room, target } = req.body;
   if (!target) return res.status(400).json({ error: 'target is required.' });
   try {
@@ -255,7 +278,7 @@ app.post('/transcribe', transcribeRateLimit, upload.single('audio'), async (req,
       console.log(`[transcribe] noSpeechProb=${avgNoSpeechProb.toFixed(2)} logProb=${avgLogProb.toFixed(2)} text="${rawText}"`);
 
       // Loosened from 0.45/-0.7 — was rejecting real speech
-    if (avgNoSpeechProb > 0.5 || avgLogProb < -1.0) {
+      if (avgNoSpeechProb > 0.5 || avgLogProb < -1.0) {
         return res.json({ text: '' });
       }
     } else if (!rawText) {
