@@ -1,8 +1,10 @@
 import { useEffect, useRef, useCallback } from 'react';
 
 const SERVER = process.env.REACT_APP_SERVER_URL || 'http://localhost:5000';
-const CHUNK_MS = 4000;          // length of each recorded chunk sent for transcription
-const MIN_BLOB_BYTES = 3000;    // skip near-silent/empty chunks (saves API calls)
+const CHUNK_MS = 4000;              // length of each recorded chunk
+const MIN_BLOB_BYTES = 3000;        // skip near-empty chunks
+const SILENCE_RMS_THRESHOLD = 0.012; // below this = "silence" (tune if needed)
+const MIN_VOICED_RATIO = 0.15;      // fraction of chunk that must be "loud enough" to bother sending
 
 // ── Text post-processor ───────────────────────────────────────────────────────
 function cleanText(text) {
@@ -37,9 +39,10 @@ function isTooSimilar(a, b) {
   return false;
 }
 
-// ── Whisper sometimes "hallucinates" a stock phrase on near-silent audio ──────
+// ── Whisper "stock phrase" hallucinations on silence/noise ────────────────────
 const HALLUCINATIONS = new Set([
   'thank you', 'thanks for watching', 'bye', 'you', 'thank you for watching',
+  'thanks for watching!', 'please subscribe', 'subscribe', 'i', 'okay', 'ok',
 ]);
 
 function pickMimeType() {
@@ -64,6 +67,12 @@ const useTranscript = (username, onNewLine, onInterim, isActive) => {
   const mimeTypeRef    = useRef('');
   const lastFinalText  = useRef('');
 
+  // ── Web Audio analysis (for silence detection) ────────────────────────────
+  const audioCtxRef  = useRef(null);
+  const analyserRef  = useRef(null);
+  const rmsSamplesRef = useRef([]);
+  const rmsIntervalRef = useRef(null);
+
   const onNewLineRef = useRef(onNewLine);
   const onInterimRef = useRef(onInterim);
   const usernameRef  = useRef(username);
@@ -72,8 +81,61 @@ const useTranscript = (username, onNewLine, onInterim, isActive) => {
   useEffect(() => { onInterimRef.current = onInterim; }, [onInterim]);
   useEffect(() => { usernameRef.current  = username;  }, [username]);
 
-  const sendChunk = useCallback(async (blob) => {
+  const startRmsSampling = useCallback((stream) => {
+    try {
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+      const audioCtx = new AudioContextClass();
+      const source = audioCtx.createMediaStreamSource(stream);
+      const analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 2048;
+      source.connect(analyser);
+
+      audioCtxRef.current = audioCtx;
+      analyserRef.current = analyser;
+
+      const data = new Uint8Array(analyser.fftSize);
+      rmsIntervalRef.current = setInterval(() => {
+        if (!analyserRef.current) return;
+        analyserRef.current.getByteTimeDomainData(data);
+        let sumSquares = 0;
+        for (let i = 0; i < data.length; i++) {
+          const norm = (data[i] - 128) / 128;
+          sumSquares += norm * norm;
+        }
+        const rms = Math.sqrt(sumSquares / data.length);
+        rmsSamplesRef.current.push(rms);
+      }, 100); // sample every 100ms
+    } catch (err) {
+      console.warn('Audio analysis setup failed (will send all chunks):', err.message);
+    }
+  }, []);
+
+  const stopRmsSampling = useCallback(() => {
+    clearInterval(rmsIntervalRef.current);
+    if (audioCtxRef.current) {
+      audioCtxRef.current.close().catch(() => {});
+      audioCtxRef.current = null;
+    }
+    analyserRef.current = null;
+  }, []);
+
+  // Returns true if the just-recorded window had enough voiced audio to bother sending
+  const consumeVoicedCheck = useCallback(() => {
+    const samples = rmsSamplesRef.current;
+    rmsSamplesRef.current = [];
+    if (samples.length === 0) return true; // analysis unavailable — fail open, send anyway
+
+    const voicedCount = samples.filter(rms => rms > SILENCE_RMS_THRESHOLD).length;
+    const ratio = voicedCount / samples.length;
+    return ratio >= MIN_VOICED_RATIO;
+  }, []);
+
+  const sendChunk = useCallback(async (blob, hadVoice) => {
     if (!blob || blob.size < MIN_BLOB_BYTES) return;
+    if (!hadVoice) {
+      console.debug('Skipped chunk — no voice activity detected.');
+      return;
+    }
 
     onInterimRef.current?.('Transcribing…');
 
@@ -144,6 +206,8 @@ const useTranscript = (username, onNewLine, onInterim, isActive) => {
       return;
     }
 
+    rmsSamplesRef.current = []; // reset for this window
+
     const localChunks = [];
     recorder.ondataavailable = (e) => {
       if (e.data && e.data.size > 0) localChunks.push(e.data);
@@ -151,8 +215,9 @@ const useTranscript = (username, onNewLine, onInterim, isActive) => {
 
     recorder.onstop = () => {
       const blob = new Blob(localChunks, { type: mimeType || 'audio/webm' });
+      const hadVoice = consumeVoicedCheck();
       if (!isStoppingRef.current) {
-        sendChunk(blob);
+        sendChunk(blob, hadVoice);
         recordNextChunk();
       }
     };
@@ -163,7 +228,7 @@ const useTranscript = (username, onNewLine, onInterim, isActive) => {
     chunkTimer.current = setTimeout(() => {
       if (recorder.state !== 'inactive') recorder.stop();
     }, CHUNK_MS);
-  }, [sendChunk]);
+  }, [sendChunk, consumeVoicedCheck]);
 
   useEffect(() => {
     isMounted.current = true;
@@ -183,6 +248,7 @@ const useTranscript = (username, onNewLine, onInterim, isActive) => {
         }
         streamRef.current = stream;
         mimeTypeRef.current = pickMimeType();
+        startRmsSampling(stream);
         recordNextChunk();
       } catch (err) {
         console.warn('Mic access error:', err.message);
@@ -194,6 +260,7 @@ const useTranscript = (username, onNewLine, onInterim, isActive) => {
     return () => {
       isStoppingRef.current = true;
       clearTimeout(chunkTimer.current);
+      stopRmsSampling();
       if (recorderRef.current && recorderRef.current.state !== 'inactive') {
         try { recorderRef.current.stop(); } catch (_) {}
       }
@@ -203,7 +270,7 @@ const useTranscript = (username, onNewLine, onInterim, isActive) => {
       }
       onInterimRef.current?.('');
     };
-  }, [isActive, recordNextChunk]);
+  }, [isActive, recordNextChunk, startRmsSampling, stopRmsSampling]);
 };
 
 export default useTranscript;

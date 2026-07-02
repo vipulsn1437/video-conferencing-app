@@ -222,7 +222,7 @@ app.post('/transcribe', transcribeRateLimit, upload.single('audio'), async (req,
     form.append('file', blob, req.file.originalname || 'audio.webm');
     form.append('model', 'whisper-large-v3-turbo');
     form.append('language', 'en');
-    form.append('response_format', 'json');
+    form.append('response_format', 'verbose_json');
 
     const response = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
       method: 'POST',
@@ -234,6 +234,26 @@ app.post('/transcribe', transcribeRateLimit, upload.single('audio'), async (req,
     if (!response.ok) {
       console.error('Groq transcription error:', data);
       return res.status(502).json({ error: data.error?.message || 'Groq transcription error.' });
+    }
+
+    // ── Reject low-confidence / no-speech segments ─────────────────────────
+    // verbose_json returns a `segments` array, each with a no_speech_prob
+    // (Whisper's own estimate that the segment contains NO speech).
+    const segments = data.segments || [];
+    if (segments.length > 0) {
+      const avgNoSpeechProb =
+        segments.reduce((sum, s) => sum + (s.no_speech_prob || 0), 0) / segments.length;
+      const avgLogProb =
+        segments.reduce((sum, s) => sum + (s.avg_logprob ?? 0), 0) / segments.length;
+
+      // Tune these thresholds if you get false positives/negatives:
+      // - no_speech_prob close to 1 = Whisper thinks it's silence/noise
+      // - avg_logprob very negative = Whisper isn't confident in the words
+      if (avgNoSpeechProb > 0.6 || avgLogProb < -1.0) {
+        return res.json({ text: '' });
+      }
+    } else if (!data.text?.trim()) {
+      return res.json({ text: '' });
     }
 
     res.json({ text: data.text || '' });
