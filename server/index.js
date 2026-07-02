@@ -3,7 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
 const { AccessToken, RoomServiceClient } = require('livekit-server-sdk');
-const admin = require('./firebaseAdmin');
+const { auth } = require('./firebaseAdmin');
 
 // ── Startup checks ────────────────────────────────────────────────────────────
 const LIVEKIT_API_KEY    = process.env.LIVEKIT_API_KEY    || 'devkey';
@@ -55,7 +55,7 @@ async function verifyAuth(req, res, next) {
   }
 
   try {
-    const decoded = await admin.auth().verifyIdToken(idToken);
+    const decoded = await auth.verifyIdToken(idToken);
     req.uid = decoded.uid;
     req.userEmail = decoded.email || null;
     next();
@@ -240,8 +240,6 @@ app.post('/transcribe', transcribeRateLimit, upload.single('audio'), async (req,
   }
 
   try {
-    // Short, neutral vocabulary hint only — NOT a descriptive sentence.
-    // Descriptive/meta prompts get echoed back by Whisper when audio is unclear.
     const prompt = 'meeting, project, decision, action item, transcript';
 
     const form = new FormData();
@@ -267,7 +265,6 @@ app.post('/transcribe', transcribeRateLimit, upload.single('audio'), async (req,
 
     const rawText = (data.text || '').trim();
 
-    // ── Reject low-confidence / no-speech segments ─────────────────────────
     const segments = data.segments || [];
     if (segments.length > 0) {
       const avgNoSpeechProb =
@@ -277,7 +274,6 @@ app.post('/transcribe', transcribeRateLimit, upload.single('audio'), async (req,
 
       console.log(`[transcribe] noSpeechProb=${avgNoSpeechProb.toFixed(2)} logProb=${avgLogProb.toFixed(2)} text="${rawText}"`);
 
-      // Loosened from 0.45/-0.7 — was rejecting real speech
       if (avgNoSpeechProb > 0.5 || avgLogProb < -1.0) {
         return res.json({ text: '' });
       }
@@ -285,13 +281,11 @@ app.post('/transcribe', transcribeRateLimit, upload.single('audio'), async (req,
       return res.json({ text: '' });
     }
 
-    // ── Echo detection: reject if output closely matches the prompt itself ──
     const normalize = s => s.toLowerCase().replace(/[^a-z0-9]/g, '');
     const normalizedOut = normalize(rawText);
     const promptWords = ['meeting', 'project', 'decision', 'actionitem', 'transcript'];
     const echoedPromptWords = promptWords.filter(w => normalizedOut.includes(w)).length;
     if (echoedPromptWords >= 2 && rawText.split(/\s+/).length <= 12) {
-      // Short output that's mostly prompt vocabulary = the model parroting the hint, not real speech
       return res.json({ text: '' });
     }
 
