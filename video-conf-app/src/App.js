@@ -422,7 +422,11 @@ function App() {
             token={token}
             connect={true}
             video={false}
-            audio={false}
+            audio={{
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true,
+            }}
             data-lk-theme="default"
             onDisconnected={leaveRoom}
           >
