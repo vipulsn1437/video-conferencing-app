@@ -14,7 +14,7 @@ import AuthScreen from './components/AuthScreen';
 import AvatarPlaceholder from './components/AvatarPlaceholder';
 
 
-import { auth } from './firebase';
+
 
 async function authedFetch(url, options = {}) {
   console.log("Current user:", auth.currentUser);
@@ -31,6 +31,8 @@ async function authedFetch(url, options = {}) {
     },
   });
 }
+
+
 
 const SERVER = process.env.REACT_APP_SERVER_URL || 'http://localhost:5000';
 const LIVEKIT_URL = process.env.REACT_APP_LIVEKIT_URL || 'ws://localhost:7880';
