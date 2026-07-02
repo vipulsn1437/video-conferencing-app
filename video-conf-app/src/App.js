@@ -8,21 +8,14 @@ import ParticipantList from './components/ParticipantList';
 import './App.css';
 import useTranscript from './useTranscript';
 import useSharedTranscript from './useSharedTranscript';
+import useRecordingStatus from './useRecordingStatus';
 import { onAuthStateChanged, signOut } from 'firebase/auth';
 import { auth } from './firebase';
 import AuthScreen from './components/AuthScreen';
 import AvatarPlaceholder from './components/AvatarPlaceholder';
 
-
-
-
 async function authedFetch(url, options = {}) {
-  console.log("Current user:", auth.currentUser);
-
   const token = await auth.currentUser?.getIdToken();
-
-  console.log("ID Token:", token);
-
   return fetch(url, {
     ...options,
     headers: {
@@ -31,8 +24,6 @@ async function authedFetch(url, options = {}) {
     },
   });
 }
-
-
 
 const SERVER = process.env.REACT_APP_SERVER_URL || 'http://localhost:5000';
 const LIVEKIT_URL = process.env.REACT_APP_LIVEKIT_URL || 'ws://localhost:7880';
@@ -65,6 +56,7 @@ function App() {
   const [joinError, setJoinError]               = useState('');
   const [participants, setParticipants]         = useState([]);
   const [isHost, setIsHost]                     = useState(false);
+  const [isRecordingBusy, setIsRecordingBusy]   = useState(false);
 
   // ── Join screen mode ──────────────────────────────────────────────────────
   const [mode, setMode]                   = useState('create');
@@ -72,16 +64,19 @@ function App() {
   const [joinInput, setJoinInput]         = useState('');
   const [copyLabel, setCopyLabel]         = useState('Copy link');
 
+  // ── Recording status (shared, visible to everyone in the room) ────────────
+  const isRecording = useRecordingStatus(joined ? room : null);
+
   // ── Auth effects ──────────────────────────────────────────────────────────
   useEffect(() => {
     return onAuthStateChanged(auth, u => setUser(u ?? null));
   }, []);
 
   useEffect(() => {
-  if (user?.displayName && !username) {
-    setUsername(user.displayName);
-  }
-}, [user, username]);
+    if (user?.displayName && !username) {
+      setUsername(user.displayName);
+    }
+  }, [user, username]);
 
   useEffect(() => {
     if (user === null) {
@@ -168,9 +163,9 @@ function App() {
     setMeetingStartTime(null);
 
     try {
-     const res = await authedFetch(
-  `${SERVER}/token?username=${encodeURIComponent(trimmedName)}&room=${encodeURIComponent(roomName)}&create=${mode === 'create'}&photoURL=${encodeURIComponent(user?.photoURL || '')}`
-);
+      const res = await authedFetch(
+        `${SERVER}/token?username=${encodeURIComponent(trimmedName)}&room=${encodeURIComponent(roomName)}&create=${mode === 'create'}&photoURL=${encodeURIComponent(user?.photoURL || '')}`
+      );
       if (!res.ok) {
         const err = await res.json();
         throw new Error(err.error || 'Server error');
@@ -227,64 +222,93 @@ function App() {
   };
 
   // ── Host actions ──────────────────────────────────────────────────────────
- const muteAllParticipants = useCallback(async () => {
-  try {
-    const res = await authedFetch(`${SERVER}/host/mute-all`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ room }),
-    });
-
-    if (!res.ok) {
-      const err = await res.json();
-      throw new Error(err.error || 'Server error');
+  const muteAllParticipants = useCallback(async () => {
+    try {
+      const res = await authedFetch(`${SERVER}/host/mute-all`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ room }),
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.error || 'Server error');
+      }
+    } catch (err) {
+      alert(`Error muting participants: ${err.message}`);
     }
-  } catch (err) {
-    alert(`Error muting participants: ${err.message}`);
-  }
-}, [room]);
+  }, [room]);
 
-const muteParticipant = useCallback(async (targetIdentity) => {
-  try {
-    const res = await authedFetch(`${SERVER}/host/mute-participant`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        room,
-        target: targetIdentity,
-      }),
-    });
-
-    if (!res.ok) {
-      const err = await res.json();
-      throw new Error(err.error || 'Server error');
+  const muteParticipant = useCallback(async (targetIdentity) => {
+    try {
+      const res = await authedFetch(`${SERVER}/host/mute-participant`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ room, target: targetIdentity }),
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.error || 'Server error');
+      }
+    } catch (err) {
+      alert(`Error muting participant: ${err.message}`);
     }
-  } catch (err) {
-    alert(`Error muting participant: ${err.message}`);
-  }
-}, [room]);
+  }, [room]);
 
-const removeParticipant = useCallback(async (targetIdentity) => {
-  if (!window.confirm(`Remove ${targetIdentity} from the meeting?`)) return;
-
-  try {
-    const res = await authedFetch(`${SERVER}/host/remove-participant`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        room,
-        target: targetIdentity,
-      }),
-    });
-
-    if (!res.ok) {
-      const err = await res.json();
-      throw new Error(err.error || 'Server error');
+  const removeParticipant = useCallback(async (targetIdentity) => {
+    if (!window.confirm(`Remove ${targetIdentity} from the meeting?`)) return;
+    try {
+      const res = await authedFetch(`${SERVER}/host/remove-participant`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ room, target: targetIdentity }),
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.error || 'Server error');
+      }
+    } catch (err) {
+      alert(`Error removing participant: ${err.message}`);
     }
-  } catch (err) {
-    alert(`Error removing participant: ${err.message}`);
-  }
-}, [room]);
+  }, [room]);
+
+  // ── Recording actions (host only) ──────────────────────────────────────────
+  const startRecording = useCallback(async () => {
+    setIsRecordingBusy(true);
+    try {
+      const res = await authedFetch(`${SERVER}/host/start-recording`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ room }),
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.error || 'Server error');
+      }
+    } catch (err) {
+      alert(`Error starting recording: ${err.message}`);
+    } finally {
+      setIsRecordingBusy(false);
+    }
+  }, [room]);
+
+  const stopRecording = useCallback(async () => {
+    setIsRecordingBusy(true);
+    try {
+      const res = await authedFetch(`${SERVER}/host/stop-recording`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ room }),
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.error || 'Server error');
+      }
+    } catch (err) {
+      alert(`Error stopping recording: ${err.message}`);
+    } finally {
+      setIsRecordingBusy(false);
+    }
+  }, [room]);
 
   // ── Downloads ─────────────────────────────────────────────────────────────
   const downloadTranscript = useCallback(() => {
@@ -433,6 +457,22 @@ const removeParticipant = useCallback(async (targetIdentity) => {
           {isHost && <span className="host-badge">Host</span>}
         </div>
         <div className="topbar-right">
+          {isRecording && (
+            <span className="recording-badge">
+              <span className="recording-dot" /> Recording
+            </span>
+          )}
+          {isHost && (
+            <button
+              className="pause-btn"
+              onClick={isRecording ? stopRecording : startRecording}
+              disabled={isRecordingBusy}
+            >
+              {isRecordingBusy
+                ? 'Please wait…'
+                : isRecording ? '⏹ Stop Recording' : '⏺ Start Recording'}
+            </button>
+          )}
           <span className="participant-count">
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none"
               stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">

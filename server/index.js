@@ -2,8 +2,8 @@ require('dotenv').config({ path: '.env.local' });
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
-const { AccessToken, RoomServiceClient } = require('livekit-server-sdk');
-const { auth } = require('./firebaseAdmin');
+const { AccessToken, RoomServiceClient, EgressClient, EncodedFileOutput, S3Upload } = require('livekit-server-sdk');
+const { auth, firestore } = require('./firebaseAdmin');
 const { transliterate } = require('transliteration');
 
 // ── Startup checks ────────────────────────────────────────────────────────────
@@ -15,8 +15,18 @@ const PORT               = process.env.PORT || 5000;
 const CLIENT_URL         = process.env.CLIENT_URL || 'http://localhost:3000';
 const GROQ_MODEL         = 'llama-3.3-70b-versatile';
 
+// ── Backblaze B2 (S3-compatible) storage for recordings ───────────────────────
+const B2_KEY_ID          = process.env.B2_KEY_ID;
+const B2_APPLICATION_KEY = process.env.B2_APPLICATION_KEY;
+const B2_ENDPOINT        = process.env.B2_ENDPOINT;
+const B2_BUCKET          = process.env.B2_BUCKET;
+const B2_REGION          = process.env.B2_REGION || 'us-west-000'; // match your bucket's actual region
+
 if (!GROQ_KEY) {
   console.error('❌  GROQ_KEY is not set in .env — /summarize and /transcribe will not work.');
+}
+if (!B2_KEY_ID || !B2_APPLICATION_KEY || !B2_ENDPOINT || !B2_BUCKET) {
+  console.error('❌  B2_KEY_ID / B2_APPLICATION_KEY / B2_ENDPOINT / B2_BUCKET not fully set — recording will not work.');
 }
 
 // ── App setup ─────────────────────────────────────────────────────────────────
@@ -36,6 +46,10 @@ const roomService = new RoomServiceClient(
   LIVEKIT_API_KEY,
   LIVEKIT_API_SECRET
 );
+
+// ── LiveKit Egress (recording) ────────────────────────────────────────────────
+const egressClient = new EgressClient(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET);
+const roomEgress = new Map(); // room -> egressId
 
 // ── Multer (in-memory, for audio chunk uploads) ───────────────────────────────
 const upload = multer({
@@ -231,6 +245,70 @@ app.post('/host/remove-participant', verifyAuth, requireHost, async (req, res) =
   }
 });
 
+// ── /host/start-recording ─────────────────────────────────────────────────────
+app.post('/host/start-recording', verifyAuth, requireHost, async (req, res) => {
+  const { room } = req.body;
+
+  if (!B2_KEY_ID || !B2_APPLICATION_KEY || !B2_ENDPOINT || !B2_BUCKET) {
+    return res.status(503).json({ error: 'Recording storage is not configured on the server.' });
+  }
+  if (roomEgress.has(room)) {
+    return res.status(409).json({ error: 'Recording is already in progress.' });
+  }
+
+  try {
+    const fileOutput = new EncodedFileOutput({
+      filepath: `recordings/${room}-{time}.mp4`,
+      output: {
+        case: 's3',
+        value: new S3Upload({
+          accessKey: B2_KEY_ID,
+          secret: B2_APPLICATION_KEY,
+          bucket: B2_BUCKET,
+          endpoint: B2_ENDPOINT,
+          region: B2_REGION,
+          forcePathStyle: true,
+        }),
+      },
+    });
+
+    const info = await egressClient.startRoomCompositeEgress(room, { file: fileOutput }, {
+      layout: 'grid',
+    });
+
+    roomEgress.set(room, info.egressId);
+
+    await firestore.collection('rooms').doc(room).set({ isRecording: true }, { merge: true });
+
+    res.json({ ok: true, egressId: info.egressId });
+  } catch (err) {
+    console.error('Start-recording error:', err);
+    res.status(500).json({ error: 'Failed to start recording.' });
+  }
+});
+
+// ── /host/stop-recording ──────────────────────────────────────────────────────
+app.post('/host/stop-recording', verifyAuth, requireHost, async (req, res) => {
+  const { room } = req.body;
+  const egressId = roomEgress.get(room);
+
+  if (!egressId) {
+    return res.status(404).json({ error: 'No active recording for this room.' });
+  }
+
+  try {
+    await egressClient.stopEgress(egressId);
+    roomEgress.delete(room);
+
+    await firestore.collection('rooms').doc(room).set({ isRecording: false }, { merge: true });
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Stop-recording error:', err);
+    res.status(500).json({ error: 'Failed to stop recording.' });
+  }
+});
+
 // ── /transcribe ────────────────────────────────────────────────────────────────
 app.post('/transcribe', transcribeRateLimit, upload.single('audio'), async (req, res) => {
   if (!req.file) {
@@ -241,13 +319,15 @@ app.post('/transcribe', transcribeRateLimit, upload.single('audio'), async (req,
   }
 
   try {
+    // Short, neutral vocabulary hint only — NOT a descriptive sentence.
+    // Descriptive/meta prompts get echoed back by Whisper when audio is unclear.
     const prompt = 'meeting, project, decision, action item, transcript';
 
     const form = new FormData();
     const blob = new Blob([req.file.buffer], { type: req.file.mimetype || 'audio/webm' });
     form.append('file', blob, req.file.originalname || 'audio.webm');
     form.append('model', 'whisper-large-v3');
-    
+    // No `language` param — let Whisper auto-detect so Hindi isn't force-transcribed as English.
     form.append('response_format', 'verbose_json');
     form.append('temperature', '0');
     form.append('prompt', prompt);
@@ -265,14 +345,15 @@ app.post('/transcribe', transcribeRateLimit, upload.single('audio'), async (req,
     }
 
     const rawText = (data.text || '').trim();
-const detectedLanguage = (data.language || '').toLowerCase(); // Whisper returns this in verbose_json
+    const detectedLanguage = (data.language || '').toLowerCase(); // Whisper returns this in verbose_json
 
-// ── Convert Hindi (Devanagari) output to Hinglish (Roman script) ─────────
-let finalText = rawText;
-if (detectedLanguage === 'hindi' || detectedLanguage === 'hi') {
-  finalText = transliterate(rawText);
-}
+    // ── Convert Hindi (Devanagari) output to Hinglish (Roman script) ─────────
+    let finalText = rawText;
+    if (detectedLanguage === 'hindi' || detectedLanguage === 'hi') {
+      finalText = transliterate(rawText);
+    }
 
+    // ── Reject low-confidence / no-speech segments ─────────────────────────
     const segments = data.segments || [];
     if (segments.length > 0) {
       const avgNoSpeechProb =
@@ -280,8 +361,9 @@ if (detectedLanguage === 'hindi' || detectedLanguage === 'hi') {
       const avgLogProb =
         segments.reduce((sum, s) => sum + (s.avg_logprob ?? 0), 0) / segments.length;
 
-      console.log(`[transcribe] noSpeechProb=${avgNoSpeechProb.toFixed(2)} logProb=${avgLogProb.toFixed(2)} text="${rawText}"`);
+      console.log(`[transcribe] lang=${detectedLanguage} noSpeechProb=${avgNoSpeechProb.toFixed(2)} logProb=${avgLogProb.toFixed(2)} text="${rawText}"`);
 
+      // Loosened from 0.45/-0.7 — was rejecting real speech
       if (avgNoSpeechProb > 0.5 || avgLogProb < -1.0) {
         return res.json({ text: '' });
       }
@@ -289,11 +371,13 @@ if (detectedLanguage === 'hindi' || detectedLanguage === 'hi') {
       return res.json({ text: '' });
     }
 
+    // ── Echo detection: reject if output closely matches the prompt itself ──
     const normalize = s => s.toLowerCase().replace(/[^a-z0-9]/g, '');
     const normalizedOut = normalize(rawText);
     const promptWords = ['meeting', 'project', 'decision', 'actionitem', 'transcript'];
     const echoedPromptWords = promptWords.filter(w => normalizedOut.includes(w)).length;
     if (echoedPromptWords >= 2 && rawText.split(/\s+/).length <= 12) {
+      // Short output that's mostly prompt vocabulary = the model parroting the hint, not real speech
       return res.json({ text: '' });
     }
 
@@ -361,12 +445,14 @@ app.get('/health', (_req, res) => {
     status: 'ok',
     groq: !!GROQ_KEY,
     livekit: !!LIVEKIT_API_KEY,
+    recordingStorage: !!(B2_KEY_ID && B2_APPLICATION_KEY && B2_ENDPOINT && B2_BUCKET),
   });
 });
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`✅  Server running on http://localhost:${PORT}`);
-  console.log(`    GROQ:    ${GROQ_KEY ? '✅ configured' : '❌ missing'}`);
-  console.log(`    LiveKit: ${LIVEKIT_API_KEY !== 'devkey' ? '✅ configured' : '⚠️  using devkey'}`);
+  console.log(`    GROQ:      ${GROQ_KEY ? '✅ configured' : '❌ missing'}`);
+  console.log(`    LiveKit:   ${LIVEKIT_API_KEY !== 'devkey' ? '✅ configured' : '⚠️  using devkey'}`);
+  console.log(`    Recording: ${(B2_KEY_ID && B2_APPLICATION_KEY && B2_ENDPOINT && B2_BUCKET) ? '✅ configured (B2)' : '❌ missing B2 env vars'}`);
 });
