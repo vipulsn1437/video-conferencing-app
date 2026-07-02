@@ -69,7 +69,7 @@ function transcribeRateLimit(req, res, next) {
   const ip  = req.ip;
   const now = Date.now();
   const windowMs = 60_000;
-  const max = 40; // one call roughly every ~4s while someone is talking
+  const max = 80; // dual-lane recording roughly doubles call frequency
   const entry = transcribeHits.get(ip) || { count: 0, start: now };
   if (now - entry.start > windowMs) {
     entry.count = 0;
@@ -217,12 +217,18 @@ app.post('/transcribe', transcribeRateLimit, upload.single('audio'), async (req,
   }
 
   try {
+    const previousText = (req.body.previousText || '').trim();
+    const basePrompt = 'This is a business meeting transcript. Speakers discuss projects, decisions, and action items.';
+    const prompt = previousText ? `${basePrompt} Previous words spoken: "${previousText}"` : basePrompt;
+
     const form = new FormData();
     const blob = new Blob([req.file.buffer], { type: req.file.mimetype || 'audio/webm' });
     form.append('file', blob, req.file.originalname || 'audio.webm');
-    form.append('model', 'whisper-large-v3-turbo');
+    form.append('model', 'whisper-large-v3'); // ← more accurate than turbo
     form.append('language', 'en');
     form.append('response_format', 'verbose_json');
+    form.append('temperature', '0'); // ← deterministic output for clear speech
+    form.append('prompt', prompt);   // ← vocabulary hint + continuity from previous chunk
 
     const response = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
       method: 'POST',
@@ -237,8 +243,6 @@ app.post('/transcribe', transcribeRateLimit, upload.single('audio'), async (req,
     }
 
     // ── Reject low-confidence / no-speech segments ─────────────────────────
-    // verbose_json returns a `segments` array, each with a no_speech_prob
-    // (Whisper's own estimate that the segment contains NO speech).
     const segments = data.segments || [];
     if (segments.length > 0) {
       const avgNoSpeechProb =
@@ -246,9 +250,6 @@ app.post('/transcribe', transcribeRateLimit, upload.single('audio'), async (req,
       const avgLogProb =
         segments.reduce((sum, s) => sum + (s.avg_logprob ?? 0), 0) / segments.length;
 
-      // Tune these thresholds if you get false positives/negatives:
-      // - no_speech_prob close to 1 = Whisper thinks it's silence/noise
-      // - avg_logprob very negative = Whisper isn't confident in the words
       if (avgNoSpeechProb > 0.6 || avgLogProb < -1.0) {
         return res.json({ text: '' });
       }

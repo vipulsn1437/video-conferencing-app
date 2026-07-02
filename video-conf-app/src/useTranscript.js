@@ -1,10 +1,13 @@
 import { useEffect, useRef, useCallback } from 'react';
 
 const SERVER = process.env.REACT_APP_SERVER_URL || 'http://localhost:5000';
-const CHUNK_MS = 4000;              // length of each recorded chunk
-const MIN_BLOB_BYTES = 3000;        // skip near-empty chunks
-const SILENCE_RMS_THRESHOLD = 0.012; // below this = "silence" (tune if needed)
-const MIN_VOICED_RATIO = 0.15;      // fraction of chunk that must be "loud enough" to bother sending
+const CHUNK_MS = 6000;                // length of each lane's recording window
+const LANE_OFFSET_MS = CHUNK_MS / 2;  // lane B starts half a window after lane A
+const ENABLE_DUAL_LANE = true;        // set false if dual recorders misbehave on a device
+const MIN_BLOB_BYTES = 3000;
+const SILENCE_RMS_THRESHOLD = 0.012;
+const MIN_VOICED_RATIO = 0.15;
+const MAX_OVERLAP_WORDS = 12;         // how many trailing words to check for overlap
 
 // ── Text post-processor ───────────────────────────────────────────────────────
 function cleanText(text) {
@@ -28,7 +31,6 @@ function cleanText(text) {
     .trim();
 }
 
-// ── Duplicate detector ────────────────────────────────────────────────────────
 function isTooSimilar(a, b) {
   if (!a || !b) return false;
   const normalize = s => s.toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -39,11 +41,42 @@ function isTooSimilar(a, b) {
   return false;
 }
 
-// ── Whisper "stock phrase" hallucinations on silence/noise ────────────────────
 const HALLUCINATIONS = new Set([
   'thank you', 'thanks for watching', 'bye', 'you', 'thank you for watching',
   'thanks for watching!', 'please subscribe', 'subscribe', 'i', 'okay', 'ok',
 ]);
+
+function normalizeWord(w) {
+  return w.toLowerCase().replace(/[^a-z0-9']/g, '');
+}
+
+// Strips the leading words of newRawText that duplicate the trailing words of
+// referenceRawText — this is what removes the repeated phrase you get from
+// two overlapping lanes both catching the same spoken words.
+function stripOverlap(newRawText, referenceRawText, maxOverlapWords = MAX_OVERLAP_WORDS) {
+  if (!referenceRawText) return newRawText;
+  const refWords = referenceRawText.trim().split(/\s+/);
+  const newWords = newRawText.trim().split(/\s+/);
+  if (refWords.length === 0 || newWords.length === 0) return newRawText;
+
+  const refNorm = refWords.map(normalizeWord);
+  const newNorm = newWords.map(normalizeWord);
+
+  const maxCheck = Math.min(maxOverlapWords, refNorm.length, newNorm.length);
+  let bestOverlap = 0;
+
+  for (let len = maxCheck; len >= 2; len--) {
+    const refTail = refNorm.slice(refNorm.length - len).join(' ');
+    const newHead = newNorm.slice(0, len).join(' ');
+    if (refTail === newHead) {
+      bestOverlap = len;
+      break;
+    }
+  }
+
+  if (bestOverlap === 0) return newRawText;
+  return newWords.slice(bestOverlap).join(' ');
+}
 
 function pickMimeType() {
   const candidates = [
@@ -60,18 +93,22 @@ function pickMimeType() {
 
 const useTranscript = (username, onNewLine, onInterim, isActive) => {
   const streamRef      = useRef(null);
-  const recorderRef    = useRef(null);
-  const chunkTimer     = useRef(null);
   const isMounted      = useRef(true);
   const isStoppingRef  = useRef(false);
   const mimeTypeRef    = useRef('');
   const lastFinalText  = useRef('');
+  const referenceTextRef = useRef(''); // last raw transcript, used for overlap stripping
 
-  // ── Web Audio analysis (for silence detection) ────────────────────────────
-  const audioCtxRef  = useRef(null);
-  const analyserRef  = useRef(null);
-  const rmsSamplesRef = useRef([]);
+  // ── Shared voice-activity sampling (feeds both lanes) ──────────────────────
+  const audioCtxRef   = useRef(null);
+  const analyserRef   = useRef(null);
   const rmsIntervalRef = useRef(null);
+  const laneRmsBuffers = useRef({ A: [], B: [] });
+
+  // ── Sequencing: process transcription results in chronological order ───────
+  const seqCounterRef        = useRef(0);
+  const nextSeqToProcessRef  = useRef(0);
+  const pendingResultsRef    = useRef(new Map()); // seq -> raw text ('' = nothing usable)
 
   const onNewLineRef = useRef(onNewLine);
   const onInterimRef = useRef(onInterim);
@@ -103,8 +140,9 @@ const useTranscript = (username, onNewLine, onInterim, isActive) => {
           sumSquares += norm * norm;
         }
         const rms = Math.sqrt(sumSquares / data.length);
-        rmsSamplesRef.current.push(rms);
-      }, 100); // sample every 100ms
+        laneRmsBuffers.current.A.push(rms);
+        laneRmsBuffers.current.B.push(rms);
+      }, 100);
     } catch (err) {
       console.warn('Audio analysis setup failed (will send all chunks):', err.message);
     }
@@ -119,21 +157,52 @@ const useTranscript = (username, onNewLine, onInterim, isActive) => {
     analyserRef.current = null;
   }, []);
 
-  // Returns true if the just-recorded window had enough voiced audio to bother sending
-  const consumeVoicedCheck = useCallback(() => {
-    const samples = rmsSamplesRef.current;
-    rmsSamplesRef.current = [];
-    if (samples.length === 0) return true; // analysis unavailable — fail open, send anyway
-
+  const consumeVoicedCheck = useCallback((lane) => {
+    const samples = laneRmsBuffers.current[lane];
+    laneRmsBuffers.current[lane] = [];
+    if (samples.length === 0) return true; // analysis unavailable — fail open
     const voicedCount = samples.filter(rms => rms > SILENCE_RMS_THRESHOLD).length;
-    const ratio = voicedCount / samples.length;
-    return ratio >= MIN_VOICED_RATIO;
+    return (voicedCount / samples.length) >= MIN_VOICED_RATIO;
   }, []);
 
-  const sendChunk = useCallback(async (blob, hadVoice) => {
-    if (!blob || blob.size < MIN_BLOB_BYTES) return;
-    if (!hadVoice) {
-      console.debug('Skipped chunk — no voice activity detected.');
+  // ── Process results strictly in recording order, merging overlaps ──────────
+  const processQueue = useCallback(() => {
+    while (pendingResultsRef.current.has(nextSeqToProcessRef.current)) {
+      const seq = nextSeqToProcessRef.current;
+      const raw = pendingResultsRef.current.get(seq);
+      pendingResultsRef.current.delete(seq);
+      nextSeqToProcessRef.current += 1;
+
+      if (!raw || !raw.trim()) continue;
+
+      const bare = raw.toLowerCase().replace(/[.!?]/g, '').trim();
+      if (HALLUCINATIONS.has(bare)) continue;
+
+      const stripped = stripOverlap(raw, referenceTextRef.current);
+      referenceTextRef.current = raw; // keep latest raw text as next reference
+
+      if (!stripped.trim()) continue; // fully overlapped with previous — nothing new
+
+      const cleaned = cleanText(stripped);
+      if (cleaned.length < 3) continue;
+
+      if (isTooSimilar(cleaned, lastFinalText.current)) continue;
+      lastFinalText.current = cleaned;
+
+      const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      onNewLineRef.current?.({
+        id: `${Date.now()}-${Math.random()}`,
+        speaker: usernameRef.current,
+        text: cleaned,
+        time,
+      });
+    }
+  }, []);
+
+  const sendChunk = useCallback(async (blob, hadVoice, seq) => {
+    if (!hadVoice || !blob || blob.size < MIN_BLOB_BYTES) {
+      pendingResultsRef.current.set(seq, '');
+      processQueue();
       return;
     }
 
@@ -146,11 +215,11 @@ const useTranscript = (username, onNewLine, onInterim, isActive) => {
 
       const form = new FormData();
       form.append('audio', blob, `chunk.${ext}`);
+      if (referenceTextRef.current) {
+        form.append('previousText', referenceTextRef.current.slice(-200));
+      }
 
-      const res = await fetch(`${SERVER}/transcribe`, {
-        method: 'POST',
-        body: form,
-      });
+      const res = await fetch(`${SERVER}/transcribe`, { method: 'POST', body: form });
 
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
@@ -158,43 +227,18 @@ const useTranscript = (username, onNewLine, onInterim, isActive) => {
       }
 
       const data = await res.json();
-      const raw = (data.text || '').trim();
-
-      if (!isMounted.current) return;
-      onInterimRef.current?.('');
-
-      if (!raw || raw.length < 2) return;
-
-      const bare = raw.toLowerCase().replace(/[.!?]/g, '').trim();
-      if (HALLUCINATIONS.has(bare)) return;
-
-      const cleaned = cleanText(raw);
-      if (cleaned.length < 3) return;
-
-      if (isTooSimilar(cleaned, lastFinalText.current)) {
-        console.debug('Skipped duplicate:', cleaned);
-        return;
-      }
-      lastFinalText.current = cleaned;
-
-      const time = new Date().toLocaleTimeString([], {
-        hour: '2-digit',
-        minute: '2-digit',
-      });
-
-      onNewLineRef.current?.({
-        id: `${Date.now()}-${Math.random()}`,
-        speaker: usernameRef.current,
-        text: cleaned,
-        time,
-      });
+      pendingResultsRef.current.set(seq, (data.text || '').trim());
     } catch (err) {
-      if (isMounted.current) onInterimRef.current?.('');
       console.debug('Transcription error:', err.message);
+      pendingResultsRef.current.set(seq, '');
+    } finally {
+      if (isMounted.current) onInterimRef.current?.('');
+      processQueue();
     }
-  }, []);
+  }, [processQueue]);
 
-  const recordNextChunk = useCallback(() => {
+  // ── One recording lane: repeatedly records CHUNK_MS windows ────────────────
+  const runLane = useCallback((lane) => {
     if (!isMounted.current || !streamRef.current || isStoppingRef.current) return;
 
     const mimeType = mimeTypeRef.current;
@@ -202,12 +246,11 @@ const useTranscript = (username, onNewLine, onInterim, isActive) => {
     try {
       recorder = new MediaRecorder(streamRef.current, mimeType ? { mimeType } : undefined);
     } catch (err) {
-      console.warn('MediaRecorder init failed:', err.message);
+      console.warn(`MediaRecorder init failed (lane ${lane}):`, err.message);
       return;
     }
 
-    rmsSamplesRef.current = []; // reset for this window
-
+    const seq = seqCounterRef.current++;
     const localChunks = [];
     recorder.ondataavailable = (e) => {
       if (e.data && e.data.size > 0) localChunks.push(e.data);
@@ -215,17 +258,15 @@ const useTranscript = (username, onNewLine, onInterim, isActive) => {
 
     recorder.onstop = () => {
       const blob = new Blob(localChunks, { type: mimeType || 'audio/webm' });
-      const hadVoice = consumeVoicedCheck();
+      const hadVoice = consumeVoicedCheck(lane);
       if (!isStoppingRef.current) {
-        sendChunk(blob, hadVoice);
-        recordNextChunk();
+        sendChunk(blob, hadVoice, seq);
+        runLane(lane); // start this lane's next window immediately
       }
     };
 
-    recorderRef.current = recorder;
     recorder.start();
-
-    chunkTimer.current = setTimeout(() => {
+    setTimeout(() => {
       if (recorder.state !== 'inactive') recorder.stop();
     }, CHUNK_MS);
   }, [sendChunk, consumeVoicedCheck]);
@@ -234,6 +275,8 @@ const useTranscript = (username, onNewLine, onInterim, isActive) => {
     isMounted.current = true;
     isStoppingRef.current = false;
 
+    let laneBTimer = null;
+
     async function setup() {
       if (!isActive) return;
       if (!navigator.mediaDevices?.getUserMedia) {
@@ -241,7 +284,14 @@ const useTranscript = (username, onNewLine, onInterim, isActive) => {
         return;
       }
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+            channelCount: 1,
+          },
+        });
         if (!isMounted.current) {
           stream.getTracks().forEach(t => t.stop());
           return;
@@ -249,7 +299,13 @@ const useTranscript = (username, onNewLine, onInterim, isActive) => {
         streamRef.current = stream;
         mimeTypeRef.current = pickMimeType();
         startRmsSampling(stream);
-        recordNextChunk();
+
+        runLane('A');
+        if (ENABLE_DUAL_LANE) {
+          laneBTimer = setTimeout(() => {
+            if (isMounted.current && !isStoppingRef.current) runLane('B');
+          }, LANE_OFFSET_MS);
+        }
       } catch (err) {
         console.warn('Mic access error:', err.message);
       }
@@ -259,18 +315,15 @@ const useTranscript = (username, onNewLine, onInterim, isActive) => {
 
     return () => {
       isStoppingRef.current = true;
-      clearTimeout(chunkTimer.current);
+      clearTimeout(laneBTimer);
       stopRmsSampling();
-      if (recorderRef.current && recorderRef.current.state !== 'inactive') {
-        try { recorderRef.current.stop(); } catch (_) {}
-      }
       if (streamRef.current) {
         streamRef.current.getTracks().forEach(t => t.stop());
         streamRef.current = null;
       }
       onInterimRef.current?.('');
     };
-  }, [isActive, recordNextChunk, startRmsSampling, stopRmsSampling]);
+  }, [isActive, runLane, startRmsSampling, stopRmsSampling]);
 };
 
 export default useTranscript;
