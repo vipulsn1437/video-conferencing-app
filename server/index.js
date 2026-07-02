@@ -217,18 +217,18 @@ app.post('/transcribe', transcribeRateLimit, upload.single('audio'), async (req,
   }
 
   try {
-    const previousText = (req.body.previousText || '').trim();
-    const basePrompt = 'This is a business meeting transcript. Speakers discuss projects, decisions, and action items.';
-    const prompt = previousText ? `${basePrompt} Previous words spoken: "${previousText}"` : basePrompt;
+    // Short, neutral vocabulary hint only — NOT a descriptive sentence.
+    // Descriptive/meta prompts get echoed back by Whisper when audio is unclear.
+    const prompt = 'meeting, project, decision, action item, transcript';
 
     const form = new FormData();
     const blob = new Blob([req.file.buffer], { type: req.file.mimetype || 'audio/webm' });
     form.append('file', blob, req.file.originalname || 'audio.webm');
-    form.append('model', 'whisper-large-v3'); // ← more accurate than turbo
+    form.append('model', 'whisper-large-v3');
     form.append('language', 'en');
     form.append('response_format', 'verbose_json');
-    form.append('temperature', '0'); // ← deterministic output for clear speech
-    form.append('prompt', prompt);   // ← vocabulary hint + continuity from previous chunk
+    form.append('temperature', '0');
+    form.append('prompt', prompt);
 
     const response = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
       method: 'POST',
@@ -242,6 +242,8 @@ app.post('/transcribe', transcribeRateLimit, upload.single('audio'), async (req,
       return res.status(502).json({ error: data.error?.message || 'Groq transcription error.' });
     }
 
+    const rawText = (data.text || '').trim();
+
     // ── Reject low-confidence / no-speech segments ─────────────────────────
     const segments = data.segments || [];
     if (segments.length > 0) {
@@ -250,14 +252,25 @@ app.post('/transcribe', transcribeRateLimit, upload.single('audio'), async (req,
       const avgLogProb =
         segments.reduce((sum, s) => sum + (s.avg_logprob ?? 0), 0) / segments.length;
 
-      if (avgNoSpeechProb > 0.6 || avgLogProb < -1.0) {
+      // Tightened from 0.6 / -1.0 — ambient/unclear audio needs to be rejected harder
+      if (avgNoSpeechProb > 0.45 || avgLogProb < -0.7) {
         return res.json({ text: '' });
       }
-    } else if (!data.text?.trim()) {
+    } else if (!rawText) {
       return res.json({ text: '' });
     }
 
-    res.json({ text: data.text || '' });
+    // ── Echo detection: reject if output closely matches the prompt itself ──
+    const normalize = s => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const normalizedOut = normalize(rawText);
+    const promptWords = ['meeting', 'project', 'decision', 'actionitem', 'transcript'];
+    const echoedPromptWords = promptWords.filter(w => normalizedOut.includes(w)).length;
+    if (echoedPromptWords >= 2 && rawText.split(/\s+/).length <= 12) {
+      // Short output that's mostly prompt vocabulary = the model parroting the hint, not real speech
+      return res.json({ text: '' });
+    }
+
+    res.json({ text: rawText });
   } catch (err) {
     console.error('Transcribe error:', err);
     res.status(500).json({ error: 'Internal server error.' });

@@ -1,13 +1,13 @@
 import { useEffect, useRef, useCallback } from 'react';
 
 const SERVER = process.env.REACT_APP_SERVER_URL || 'http://localhost:5000';
-const CHUNK_MS = 6000;                // length of each lane's recording window
-const LANE_OFFSET_MS = CHUNK_MS / 2;  // lane B starts half a window after lane A
-const ENABLE_DUAL_LANE = true;        // set false if dual recorders misbehave on a device
+const CHUNK_MS = 6000;
+const LANE_OFFSET_MS = CHUNK_MS / 2;
+const ENABLE_DUAL_LANE = true;
 const MIN_BLOB_BYTES = 3000;
-const SILENCE_RMS_THRESHOLD = 0.012;
-const MIN_VOICED_RATIO = 0.15;
-const MAX_OVERLAP_WORDS = 12;         // how many trailing words to check for overlap
+const SILENCE_RMS_THRESHOLD = 0.02;   // raised from 0.012 — less sensitive to faint ambient audio
+const MIN_VOICED_RATIO = 0.35;        // raised from 0.15 — requires sustained speech, not brief noise
+const MAX_OVERLAP_WORDS = 12;
 
 // ── Text post-processor ───────────────────────────────────────────────────────
 function cleanText(text) {
@@ -41,18 +41,29 @@ function isTooSimilar(a, b) {
   return false;
 }
 
+// ── Known junk: Whisper stock hallucinations + observed UI/ambient leakage ────
 const HALLUCINATIONS = new Set([
   'thank you', 'thanks for watching', 'bye', 'you', 'thank you for watching',
   'thanks for watching!', 'please subscribe', 'subscribe', 'i', 'okay', 'ok',
+  'activate windows', 'go to settings to activate windows',
+  'video conference', 'vca', 'share screen', 'camera', 'chat', 'microphone',
+  'chat microphone and video', 'chat microphone leave', 'leave', 'sigh',
+  'previous words spoken', 'precious words spoken', 'hello hello hello',
+  'video conferencing', 'and summaries', 'please read the description',
 ]);
+
+// Reject if the text is mostly weather-report vocabulary (ambient audio pickup)
+const WEATHER_WORDS = ['weather', 'humidity', 'thunderstorm', 'precipitation', 'celsius', 'clouds', 'winds', 'forecast'];
+function looksLikeWeatherReport(text) {
+  const lower = text.toLowerCase();
+  const hits = WEATHER_WORDS.filter(w => lower.includes(w)).length;
+  return hits >= 2;
+}
 
 function normalizeWord(w) {
   return w.toLowerCase().replace(/[^a-z0-9']/g, '');
 }
 
-// Strips the leading words of newRawText that duplicate the trailing words of
-// referenceRawText — this is what removes the repeated phrase you get from
-// two overlapping lanes both catching the same spoken words.
 function stripOverlap(newRawText, referenceRawText, maxOverlapWords = MAX_OVERLAP_WORDS) {
   if (!referenceRawText) return newRawText;
   const refWords = referenceRawText.trim().split(/\s+/);
@@ -97,18 +108,16 @@ const useTranscript = (username, onNewLine, onInterim, isActive) => {
   const isStoppingRef  = useRef(false);
   const mimeTypeRef    = useRef('');
   const lastFinalText  = useRef('');
-  const referenceTextRef = useRef(''); // last raw transcript, used for overlap stripping
+  const referenceTextRef = useRef('');
 
-  // ── Shared voice-activity sampling (feeds both lanes) ──────────────────────
   const audioCtxRef   = useRef(null);
   const analyserRef   = useRef(null);
   const rmsIntervalRef = useRef(null);
   const laneRmsBuffers = useRef({ A: [], B: [] });
 
-  // ── Sequencing: process transcription results in chronological order ───────
   const seqCounterRef        = useRef(0);
   const nextSeqToProcessRef  = useRef(0);
-  const pendingResultsRef    = useRef(new Map()); // seq -> raw text ('' = nothing usable)
+  const pendingResultsRef    = useRef(new Map());
 
   const onNewLineRef = useRef(onNewLine);
   const onInterimRef = useRef(onInterim);
@@ -160,12 +169,11 @@ const useTranscript = (username, onNewLine, onInterim, isActive) => {
   const consumeVoicedCheck = useCallback((lane) => {
     const samples = laneRmsBuffers.current[lane];
     laneRmsBuffers.current[lane] = [];
-    if (samples.length === 0) return true; // analysis unavailable — fail open
+    if (samples.length === 0) return true;
     const voicedCount = samples.filter(rms => rms > SILENCE_RMS_THRESHOLD).length;
     return (voicedCount / samples.length) >= MIN_VOICED_RATIO;
   }, []);
 
-  // ── Process results strictly in recording order, merging overlaps ──────────
   const processQueue = useCallback(() => {
     while (pendingResultsRef.current.has(nextSeqToProcessRef.current)) {
       const seq = nextSeqToProcessRef.current;
@@ -177,14 +185,18 @@ const useTranscript = (username, onNewLine, onInterim, isActive) => {
 
       const bare = raw.toLowerCase().replace(/[.!?]/g, '').trim();
       if (HALLUCINATIONS.has(bare)) continue;
+      if (looksLikeWeatherReport(raw)) continue;
 
       const stripped = stripOverlap(raw, referenceTextRef.current);
-      referenceTextRef.current = raw; // keep latest raw text as next reference
+      referenceTextRef.current = raw;
 
-      if (!stripped.trim()) continue; // fully overlapped with previous — nothing new
+      if (!stripped.trim()) continue;
 
       const cleaned = cleanText(stripped);
       if (cleaned.length < 3) continue;
+
+      const cleanedBare = cleaned.toLowerCase().replace(/[.!?]/g, '').trim();
+      if (HALLUCINATIONS.has(cleanedBare)) continue;
 
       if (isTooSimilar(cleaned, lastFinalText.current)) continue;
       lastFinalText.current = cleaned;
@@ -215,9 +227,8 @@ const useTranscript = (username, onNewLine, onInterim, isActive) => {
 
       const form = new FormData();
       form.append('audio', blob, `chunk.${ext}`);
-      if (referenceTextRef.current) {
-        form.append('previousText', referenceTextRef.current.slice(-200));
-      }
+      // NOTE: previousText is intentionally no longer sent — it was leaking
+      // back into transcripts on unclear audio ("Previous words spoken" bug).
 
       const res = await fetch(`${SERVER}/transcribe`, { method: 'POST', body: form });
 
@@ -237,7 +248,6 @@ const useTranscript = (username, onNewLine, onInterim, isActive) => {
     }
   }, [processQueue]);
 
-  // ── One recording lane: repeatedly records CHUNK_MS windows ────────────────
   const runLane = useCallback((lane) => {
     if (!isMounted.current || !streamRef.current || isStoppingRef.current) return;
 
@@ -261,7 +271,7 @@ const useTranscript = (username, onNewLine, onInterim, isActive) => {
       const hadVoice = consumeVoicedCheck(lane);
       if (!isStoppingRef.current) {
         sendChunk(blob, hadVoice, seq);
-        runLane(lane); // start this lane's next window immediately
+        runLane(lane);
       }
     };
 
