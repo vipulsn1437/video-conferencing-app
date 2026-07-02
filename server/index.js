@@ -5,6 +5,8 @@ const multer = require('multer');
 const { AccessToken, RoomServiceClient, EgressClient, EncodedFileOutput, S3Upload } = require('livekit-server-sdk');
 const { auth, firestore } = require('./firebaseAdmin');
 const { transliterate } = require('transliteration');
+const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
 // ── Startup checks ────────────────────────────────────────────────────────────
 const LIVEKIT_API_KEY    = process.env.LIVEKIT_API_KEY    || 'devkey';
@@ -49,6 +51,19 @@ const roomService = new RoomServiceClient(
 
 // ── LiveKit Egress (recording) ────────────────────────────────────────────────
 const egressClient = new EgressClient(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET);
+
+const s3Client = new S3Client({
+  endpoint: B2_ENDPOINT,
+  region: B2_REGION,
+  credentials: {
+    accessKeyId: B2_KEY_ID,
+    secretAccessKey: B2_APPLICATION_KEY,
+  },
+  forcePathStyle: true,
+});
+
+const roomRecordingFile = new Map(); // room -> exact filepath in the bucket
+
 const roomEgress = new Map(); // room -> egressId
 
 // ── Multer (in-memory, for audio chunk uploads) ───────────────────────────────
@@ -253,20 +268,21 @@ app.post('/host/start-recording', verifyAuth, requireHost, async (req, res) => {
     return res.status(503).json({ error: 'Recording storage is not configured on the server.' });
   }
 
-  // Check LiveKit's actual live egress state instead of trusting a possibly-stale in-memory map
   try {
     const activeList = await egressClient.listEgress({ roomName: room, active: true });
     if (activeList.length > 0) {
-      roomEgress.set(room, activeList[0].egressId); // resync local map just in case
+      roomEgress.set(room, activeList[0].egressId);
       return res.status(409).json({ error: 'Recording is already in progress.' });
     }
   } catch (err) {
     console.error('listEgress check failed (continuing anyway):', err.message);
   }
 
+  const filepath = `recordings/${room}-${Date.now()}.mp4`; // ← we own this filename now
+
   try {
     const fileOutput = new EncodedFileOutput({
-      filepath: `recordings/${room}-{time}.mp4`,
+      filepath,
       output: {
         case: 's3',
         value: new S3Upload({
@@ -285,11 +301,10 @@ app.post('/host/start-recording', verifyAuth, requireHost, async (req, res) => {
     });
 
     roomEgress.set(room, info.egressId);
+    roomRecordingFile.set(room, filepath);
 
-    // Firestore write is a nice-to-have (drives the UI badge) — don't fail the whole
-    // request if this specifically breaks, since the actual recording already started.
     try {
-      await firestore.collection('rooms').doc(room).set({ isRecording: true }, { merge: true });
+      await firestore.collection('rooms').doc(room).set({ isRecording: true, recordingUrl: null }, { merge: true });
     } catch (fsErr) {
       console.error('Firestore isRecording write failed (recording still started):', fsErr.message);
     }
@@ -306,7 +321,6 @@ app.post('/host/stop-recording', verifyAuth, requireHost, async (req, res) => {
   const { room } = req.body;
   let egressId = roomEgress.get(room);
 
-  // Fall back to LiveKit's real state if our local map doesn't have it
   if (!egressId) {
     try {
       const activeList = await egressClient.listEgress({ roomName: room, active: true });
@@ -324,13 +338,30 @@ app.post('/host/stop-recording', verifyAuth, requireHost, async (req, res) => {
     await egressClient.stopEgress(egressId);
     roomEgress.delete(room);
 
-    try {
-      await firestore.collection('rooms').doc(room).set({ isRecording: false }, { merge: true });
-    } catch (fsErr) {
-      console.error('Firestore isRecording clear failed:', fsErr.message);
+    const filepath = roomRecordingFile.get(room);
+    roomRecordingFile.delete(room);
+
+    let recordingUrl = null;
+    if (filepath) {
+      // Give B2 a moment to finish receiving the final upload before generating the link.
+      // Egress finalizes the file asynchronously after stopEgress returns.
+      await new Promise(resolve => setTimeout(resolve, 4000));
+
+      try {
+        const command = new GetObjectCommand({ Bucket: B2_BUCKET, Key: filepath });
+        recordingUrl = await getSignedUrl(s3Client, command, { expiresIn: 3600 }); // 1 hour
+      } catch (urlErr) {
+        console.error('Presigned URL generation failed:', urlErr.message);
+      }
     }
 
-    res.json({ ok: true });
+    try {
+      await firestore.collection('rooms').doc(room).set({ isRecording: false, recordingUrl }, { merge: true });
+    } catch (fsErr) {
+      console.error('Firestore recordingUrl write failed:', fsErr.message);
+    }
+
+    res.json({ ok: true, recordingUrl });
   } catch (err) {
     console.error('Stop-recording error:', err);
     res.status(500).json({ error: 'Failed to stop recording.' });

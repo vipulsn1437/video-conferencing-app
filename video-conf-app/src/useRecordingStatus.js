@@ -4,17 +4,21 @@ import { db } from './firebase';
 
 export default function useRecordingStatus(room) {
   const [isRecording, setIsRecording] = useState(false);
+  const [recordingUrl, setRecordingUrl] = useState(null);
 
   useEffect(() => {
     if (!room) {
       setIsRecording(false);
+      setRecordingUrl(null);
       return;
     }
     const unsub = onSnapshot(doc(db, 'rooms', room), (snap) => {
-      setIsRecording(!!snap.data()?.isRecording);
+      const data = snap.data();
+      setIsRecording(!!data?.isRecording);
+      setRecordingUrl(data?.recordingUrl || null);
     });
     return () => unsub();
   }, [room]);
 
-  return isRecording;
+  return { isRecording, recordingUrl };
 }

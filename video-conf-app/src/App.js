@@ -65,7 +65,7 @@ function App() {
   const [copyLabel, setCopyLabel]         = useState('Copy link');
 
   // ── Recording status (shared, visible to everyone in the room) ────────────
-  const isRecording = useRecordingStatus(joined ? room : null);
+  const { isRecording, recordingUrl } = useRecordingStatus(joined ? room : null);
 
   // ── Auth effects ──────────────────────────────────────────────────────────
   useEffect(() => {
@@ -463,17 +463,29 @@ function App() {
             </span>
           )}
           {isHost && (
-            <button
-              className="pause-btn"
-              onClick={isRecording ? stopRecording : startRecording}
-              disabled={isRecordingBusy}
-            >
-              {isRecordingBusy
-                ? 'Please wait…'
-                : isRecording ? '⏹ Stop Recording' : '⏺ Start Recording'}
-            </button>
-          )}
-          <span className="participant-count">
+  <button
+    className="pause-btn"
+    onClick={isRecording ? stopRecording : startRecording}
+    disabled={isRecordingBusy}
+  >
+    {isRecordingBusy
+      ? 'Please wait…'
+      : isRecording ? '⏹ Stop Recording' : '⏺ Start Recording'}
+  </button>
+)}
+
+{isHost && recordingUrl && !isRecording && (
+  <a
+    href={recordingUrl}
+    target="_blank"
+    rel="noopener noreferrer"
+    className="pause-btn"
+  >
+    ⬇ Download Recording
+  </a>
+)}
+
+<span className="participant-count">
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none"
               stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" />
