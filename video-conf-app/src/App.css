@@ -869,24 +869,3 @@ body {
   font-size: 10px;
   opacity: 0.5;
 }
-
-/* ── Recording indicator (topbar) ───────────────────────────────────────── */
-.recording-badge {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  color: #f87171;
-  font-size: 12px;
-  background: rgba(248, 113, 113, 0.1);
-  padding: 4px 12px;
-  border-radius: 20px;
-  border: 1px solid rgba(248, 113, 113, 0.3);
-}
-
-.recording-dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: #f87171;
-  animation: pulse 1.4s ease-in-out infinite;
-}

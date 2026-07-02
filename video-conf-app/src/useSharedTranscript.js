@@ -26,25 +26,18 @@ const useSharedTranscript = (room, onNewLine, onMeetingStart) => {
     seenIds.current = new Set();
 
     // ── Init room startedAt ──────────────────────────────────────────────────
-  const initRoom = async () => {
-  const roomRef  = doc(db, 'rooms', room);
-  const roomSnap = await getDoc(roomRef);
+    const initRoom = async () => {
+      const roomRef  = doc(db, 'rooms', room);
+      const roomSnap = await getDoc(roomRef);
 
-  if (!roomSnap.exists()) {
-    await setDoc(roomRef, { startedAt: serverTimestamp() });
-    onMeetingStartRef.current?.(Date.now()); // approximate for creator
-  } else {
-    const data = roomSnap.data();
-    if (!data.startedAt) {
-      // Doc already exists (server created it with hostUid before this ran)
-      // but startedAt hasn't been set yet — add it now.
-      await setDoc(roomRef, { startedAt: serverTimestamp() }, { merge: true });
-      onMeetingStartRef.current?.(Date.now());
-    } else {
-      onMeetingStartRef.current?.(data.startedAt.toMillis());
-    }
-  }
-};
+      if (!roomSnap.exists()) {
+        await setDoc(roomRef, { startedAt: serverTimestamp() });
+        onMeetingStartRef.current?.(Date.now()); // approximate for creator
+      } else {
+        const startedAt = roomSnap.data().startedAt?.toMillis();
+        if (startedAt) onMeetingStartRef.current?.(startedAt);
+      }
+    };
 
     initRoom().catch(console.error);
 
