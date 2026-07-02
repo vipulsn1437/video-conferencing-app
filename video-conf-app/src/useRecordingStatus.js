@@ -12,12 +12,29 @@ export default function useRecordingStatus(room) {
       setRecordingUrl(null);
       return;
     }
-    const unsub = onSnapshot(doc(db, 'rooms', room), (snap) => {
+
+    const unsubPublic = onSnapshot(doc(db, 'rooms', room), (snap) => {
       const data = snap.data();
       setIsRecording(!!data?.isRecording);
-      setRecordingUrl(data?.recordingUrl || null);
     });
-    return () => unsub();
+
+    // This subscription will simply fail silently (permission-denied) for
+    // non-host users, per the Firestore rule — that's expected, not a bug.
+    const unsubPrivate = onSnapshot(
+      doc(db, 'rooms', room, 'private', 'recording'),
+      (snap) => {
+        setRecordingUrl(snap.data()?.recordingUrl || null);
+      },
+      () => {
+        // Non-host: permission denied is expected here.
+        setRecordingUrl(null);
+      }
+    );
+
+    return () => {
+      unsubPublic();
+      unsubPrivate();
+    };
   }, [room]);
 
   return { isRecording, recordingUrl };

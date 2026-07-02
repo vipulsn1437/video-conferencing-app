@@ -178,6 +178,11 @@ app.get('/token', verifyAuth, async (req, res) => {
 
   if (create && !roomHosts.has(room)) {
     roomHosts.set(room, uid);
+    try {
+      await firestore.collection('rooms').doc(room).set({ hostUid: uid }, { merge: true });
+    } catch (fsErr) {
+      console.error('Firestore hostUid write failed:', fsErr.message);
+    }
   }
   const isHost = roomHosts.get(room) === uid;
 
@@ -304,7 +309,8 @@ app.post('/host/start-recording', verifyAuth, requireHost, async (req, res) => {
     roomRecordingFile.set(room, filepath);
 
     try {
-      await firestore.collection('rooms').doc(room).set({ isRecording: true, recordingUrl: null }, { merge: true });
+      await firestore.collection('rooms').doc(room).set({ isRecording: true }, { merge: true });
+      await firestore.collection('rooms').doc(room).collection('private').doc('recording').set({ recordingUrl: null });
     } catch (fsErr) {
       console.error('Firestore isRecording write failed (recording still started):', fsErr.message);
     }
@@ -356,7 +362,8 @@ app.post('/host/stop-recording', verifyAuth, requireHost, async (req, res) => {
     }
 
     try {
-      await firestore.collection('rooms').doc(room).set({ isRecording: false, recordingUrl }, { merge: true });
+      await firestore.collection('rooms').doc(room).set({ isRecording: false }, { merge: true });
+      await firestore.collection('rooms').doc(room).collection('private').doc('recording').set({ recordingUrl });
     } catch (fsErr) {
       console.error('Firestore recordingUrl write failed:', fsErr.message);
     }
