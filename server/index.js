@@ -252,8 +252,16 @@ app.post('/host/start-recording', verifyAuth, requireHost, async (req, res) => {
   if (!B2_KEY_ID || !B2_APPLICATION_KEY || !B2_ENDPOINT || !B2_BUCKET) {
     return res.status(503).json({ error: 'Recording storage is not configured on the server.' });
   }
-  if (roomEgress.has(room)) {
-    return res.status(409).json({ error: 'Recording is already in progress.' });
+
+  // Check LiveKit's actual live egress state instead of trusting a possibly-stale in-memory map
+  try {
+    const activeList = await egressClient.listEgress({ roomName: room, active: true });
+    if (activeList.length > 0) {
+      roomEgress.set(room, activeList[0].egressId); // resync local map just in case
+      return res.status(409).json({ error: 'Recording is already in progress.' });
+    }
+  } catch (err) {
+    console.error('listEgress check failed (continuing anyway):', err.message);
   }
 
   try {
@@ -278,7 +286,13 @@ app.post('/host/start-recording', verifyAuth, requireHost, async (req, res) => {
 
     roomEgress.set(room, info.egressId);
 
-    await firestore.collection('rooms').doc(room).set({ isRecording: true }, { merge: true });
+    // Firestore write is a nice-to-have (drives the UI badge) — don't fail the whole
+    // request if this specifically breaks, since the actual recording already started.
+    try {
+      await firestore.collection('rooms').doc(room).set({ isRecording: true }, { merge: true });
+    } catch (fsErr) {
+      console.error('Firestore isRecording write failed (recording still started):', fsErr.message);
+    }
 
     res.json({ ok: true, egressId: info.egressId });
   } catch (err) {
@@ -290,7 +304,17 @@ app.post('/host/start-recording', verifyAuth, requireHost, async (req, res) => {
 // ── /host/stop-recording ──────────────────────────────────────────────────────
 app.post('/host/stop-recording', verifyAuth, requireHost, async (req, res) => {
   const { room } = req.body;
-  const egressId = roomEgress.get(room);
+  let egressId = roomEgress.get(room);
+
+  // Fall back to LiveKit's real state if our local map doesn't have it
+  if (!egressId) {
+    try {
+      const activeList = await egressClient.listEgress({ roomName: room, active: true });
+      if (activeList.length > 0) egressId = activeList[0].egressId;
+    } catch (err) {
+      console.error('listEgress fallback failed:', err.message);
+    }
+  }
 
   if (!egressId) {
     return res.status(404).json({ error: 'No active recording for this room.' });
@@ -300,7 +324,11 @@ app.post('/host/stop-recording', verifyAuth, requireHost, async (req, res) => {
     await egressClient.stopEgress(egressId);
     roomEgress.delete(room);
 
-    await firestore.collection('rooms').doc(room).set({ isRecording: false }, { merge: true });
+    try {
+      await firestore.collection('rooms').doc(room).set({ isRecording: false }, { merge: true });
+    } catch (fsErr) {
+      console.error('Firestore isRecording clear failed:', fsErr.message);
+    }
 
     res.json({ ok: true });
   } catch (err) {
