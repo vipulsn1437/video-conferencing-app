@@ -13,6 +13,7 @@ import { onAuthStateChanged, signOut } from 'firebase/auth';
 import { auth } from './firebase';
 import AuthScreen from './components/AuthScreen';
 import AvatarPlaceholder from './components/AvatarPlaceholder';
+import RecordingView from './components/RecordingView';
 
 async function authedFetch(url, options = {}) {
   const token = await auth.currentUser?.getIdToken();
@@ -34,6 +35,12 @@ function generateRoomId() {
 }
 
 function App() {
+
+    // ── Recording-view route (headless page LiveKit Egress records) ───────────
+  if (window.location.pathname === '/recording-view') {
+    return <RecordingView />;
+  }
+
   // ── Auth ──────────────────────────────────────────────────────────────────
   const [user, setUser] = useState(undefined);
 

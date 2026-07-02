@@ -146,6 +146,23 @@ function requireHost(req, res, next) {
   next();
 }
 
+// ── Recorder token: hidden, subscribe-only participant used by Web Egress ────
+async function createRecorderToken(room) {
+  const at = new AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, {
+    identity: `recorder-${Date.now()}`,
+    name: 'Recorder',
+    ttl: '6h',
+  });
+  at.addGrant({
+    roomJoin: true,
+    room,
+    canPublish: false,
+    canSubscribe: true,
+    hidden: true, // keeps it out of the participant list/count
+  });
+  return at.toJwt();
+}
+
 // ── /token ────────────────────────────────────────────────────────────────────
 app.get('/token', verifyAuth, async (req, res) => {
   const username = req.query.username?.trim();
@@ -286,6 +303,9 @@ app.post('/host/start-recording', verifyAuth, requireHost, async (req, res) => {
   const filepath = `recordings/${room}-${Date.now()}.mp4`; // ← we own this filename now
 
   try {
+    const recorderToken = await createRecorderToken(room);
+    const recordingPageUrl = `${CLIENT_URL}/recording-view?room=${encodeURIComponent(room)}&token=${encodeURIComponent(recorderToken)}`;
+
     const fileOutput = new EncodedFileOutput({
       filepath,
       output: {
@@ -301,9 +321,7 @@ app.post('/host/start-recording', verifyAuth, requireHost, async (req, res) => {
       },
     });
 
-    const info = await egressClient.startRoomCompositeEgress(room, { file: fileOutput }, {
-      layout: 'grid',
-    });
+    const info = await egressClient.startWebEgress(recordingPageUrl, { file: fileOutput });
 
     roomEgress.set(room, info.egressId);
     roomRecordingFile.set(room, filepath);
@@ -318,7 +336,7 @@ app.post('/host/start-recording', verifyAuth, requireHost, async (req, res) => {
     res.json({ ok: true, egressId: info.egressId });
   } catch (err) {
     console.error('Start-recording error:', err);
-    res.status(500).json({ error: 'Failed to start recording.' });
+    res.status(500).json({ error: err.message || 'Failed to start recording.' });
   }
 });
 
