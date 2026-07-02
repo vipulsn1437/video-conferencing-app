@@ -17,7 +17,12 @@ import AvatarPlaceholder from './components/AvatarPlaceholder';
 import { auth } from './firebase';
 
 async function authedFetch(url, options = {}) {
+  console.log("Current user:", auth.currentUser);
+
   const token = await auth.currentUser?.getIdToken();
+
+  console.log("ID Token:", token);
+
   return fetch(url, {
     ...options,
     headers: {
