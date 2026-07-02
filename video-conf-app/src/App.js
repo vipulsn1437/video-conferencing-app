@@ -14,15 +14,29 @@ import AuthScreen from './components/AuthScreen';
 import AvatarPlaceholder from './components/AvatarPlaceholder';
 import { auth } from './firebase';
 
-async function authedFetch(url, options = {}) {
-  const token = await auth.currentUser?.getIdToken();
-  return fetch(url, {
-    ...options,
-    headers: {
-      ...(options.headers || {}),
-      Authorization: `Bearer ${token}`,
-    },
-  });
+async function verifyAuth(req, res, next) {
+  console.log("Authorization header:", req.headers.authorization);
+
+  const authHeader = req.headers.authorization || '';
+  const idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+
+  console.log("Extracted token:", idToken ? "Present" : "Missing");
+
+  if (!idToken) {
+    return res.status(401).json({ error: 'Missing auth token.' });
+  }
+
+  try {
+    const decoded = await admin.auth().verifyIdToken(idToken);
+    console.log("Verified UID:", decoded.uid);
+
+    req.uid = decoded.uid;
+    req.userEmail = decoded.email || null;
+    next();
+  } catch (err) {
+    console.error("Token verification failed:", err);
+    return res.status(401).json({ error: 'Invalid or expired token.' });
+  }
 }
 
 const SERVER = process.env.REACT_APP_SERVER_URL || 'http://localhost:5000';
