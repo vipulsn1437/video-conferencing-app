@@ -4,6 +4,7 @@ const cors = require('cors');
 const multer = require('multer');
 const { AccessToken, RoomServiceClient } = require('livekit-server-sdk');
 const { auth } = require('./firebaseAdmin');
+const { transliterate } = require('transliteration');
 
 // ── Startup checks ────────────────────────────────────────────────────────────
 const LIVEKIT_API_KEY    = process.env.LIVEKIT_API_KEY    || 'devkey';
@@ -264,6 +265,13 @@ app.post('/transcribe', transcribeRateLimit, upload.single('audio'), async (req,
     }
 
     const rawText = (data.text || '').trim();
+const detectedLanguage = (data.language || '').toLowerCase(); // Whisper returns this in verbose_json
+
+// ── Convert Hindi (Devanagari) output to Hinglish (Roman script) ─────────
+let finalText = rawText;
+if (detectedLanguage === 'hindi' || detectedLanguage === 'hi') {
+  finalText = transliterate(rawText);
+}
 
     const segments = data.segments || [];
     if (segments.length > 0) {
@@ -289,7 +297,7 @@ app.post('/transcribe', transcribeRateLimit, upload.single('audio'), async (req,
       return res.json({ text: '' });
     }
 
-    res.json({ text: rawText });
+    res.json({ text: finalText });
   } catch (err) {
     console.error('Transcribe error:', err);
     res.status(500).json({ error: 'Internal server error.' });
