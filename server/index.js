@@ -246,7 +246,7 @@ app.post('/transcribe', transcribeRateLimit, upload.single('audio'), async (req,
     const blob = new Blob([req.file.buffer], { type: req.file.mimetype || 'audio/webm' });
     form.append('file', blob, req.file.originalname || 'audio.webm');
     form.append('model', 'whisper-large-v3');
-    form.append('language', 'en');
+    
     form.append('response_format', 'verbose_json');
     form.append('temperature', '0');
     form.append('prompt', prompt);
