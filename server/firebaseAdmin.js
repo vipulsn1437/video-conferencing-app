@@ -1,5 +1,8 @@
 const admin = require('firebase-admin');
 
+console.log('firebase-admin:', admin);
+console.log('credential:', admin.credential);
+
 admin.initializeApp({
   credential: admin.credential.cert({
     projectId: process.env.FIREBASE_PROJECT_ID,
