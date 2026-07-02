@@ -12,7 +12,7 @@ import { onAuthStateChanged, signOut } from 'firebase/auth';
 import { auth } from './firebase';
 import AuthScreen from './components/AuthScreen';
 import AvatarPlaceholder from './components/AvatarPlaceholder';
-import { auth } from './firebase';
+
 
 async function verifyAuth(req, res, next) {
   console.log("Authorization header:", req.headers.authorization);
