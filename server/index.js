@@ -1,23 +1,21 @@
 require('dotenv').config({ path: '.env.local' });
 const express = require('express');
 const cors = require('cors');
-const { AccessToken, RoomServiceClient } = require('livekit-server-sdk');
 const multer = require('multer');
-const axios = require('axios');
-const FormData = require('form-data');
+const { AccessToken, RoomServiceClient } = require('livekit-server-sdk');
 
-const LIVEKIT_API_KEY    = process.env.LIVEKIT_API_KEY || 'devkey';
+// ── Startup checks ────────────────────────────────────────────────────────────
+const LIVEKIT_API_KEY    = process.env.LIVEKIT_API_KEY    || 'devkey';
 const LIVEKIT_API_SECRET = process.env.LIVEKIT_API_SECRET || 'secret';
-const LIVEKIT_URL        = process.env.LIVEKIT_URL || 'ws://localhost:7880';
-const GROQ_KEY           = process.env.GROQ_API_KEY;
+const LIVEKIT_URL        = process.env.LIVEKIT_URL        || 'ws://localhost:7880';
+const GROQ_KEY           = process.env.GROQ_KEY;
 const PORT               = process.env.PORT || 5000;
 const CLIENT_URL         = process.env.CLIENT_URL || 'http://localhost:3000';
 const GROQ_MODEL         = 'llama-3.3-70b-versatile';
 
 if (!GROQ_KEY) {
-  console.error('❌  GROQ_API_KEY is not set — /summarize and /transcribe will not work.');
+  console.error('❌  GROQ_KEY is not set in .env — /summarize and /transcribe will not work.');
 }
-
 
 // ── App setup ─────────────────────────────────────────────────────────────────
 const app = express();
@@ -37,10 +35,16 @@ const roomService = new RoomServiceClient(
   LIVEKIT_API_SECRET
 );
 
+// ── Multer (in-memory, for audio chunk uploads) ───────────────────────────────
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 15 * 1024 * 1024 }, // 15MB — plenty for a few seconds of audio
+});
+
 // ── Host tracking (in-memory: room -> host identity) ─────────────────────────
 const roomHosts = new Map();
 
-// ── Rate limiter (manual, no extra deps) ─────────────────────────────────────
+// ── Rate limiters (manual, no extra deps) ─────────────────────────────────────
 const summarizeHits = new Map();
 function rateLimit(req, res, next) {
   const ip  = req.ip;
@@ -60,6 +64,25 @@ function rateLimit(req, res, next) {
   next();
 }
 
+const transcribeHits = new Map();
+function transcribeRateLimit(req, res, next) {
+  const ip  = req.ip;
+  const now = Date.now();
+  const windowMs = 60_000;
+  const max = 40; // one call roughly every ~4s while someone is talking
+  const entry = transcribeHits.get(ip) || { count: 0, start: now };
+  if (now - entry.start > windowMs) {
+    entry.count = 0;
+    entry.start = now;
+  }
+  entry.count++;
+  transcribeHits.set(ip, entry);
+  if (entry.count > max) {
+    return res.status(429).json({ error: 'Too many transcription requests.' });
+  }
+  next();
+}
+
 // ── Host-only guard ───────────────────────────────────────────────────────────
 function requireHost(req, res, next) {
   const { room, requester } = req.body;
@@ -71,6 +94,7 @@ function requireHost(req, res, next) {
   }
   next();
 }
+
 // ── /token ────────────────────────────────────────────────────────────────────
 app.get('/token', async (req, res) => {
   const username = req.query.username?.trim();
@@ -127,7 +151,6 @@ app.get('/token', async (req, res) => {
 });
 
 // ── /host/mute-all ────────────────────────────────────────────────────────────
-
 app.post('/host/mute-all', requireHost, async (req, res) => {
   const { room, requester } = req.body;
   try {
@@ -184,6 +207,42 @@ app.post('/host/remove-participant', requireHost, async (req, res) => {
   }
 });
 
+// ── /transcribe ────────────────────────────────────────────────────────────────
+app.post('/transcribe', transcribeRateLimit, upload.single('audio'), async (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: 'audio file is required.' });
+  }
+  if (!GROQ_KEY) {
+    return res.status(503).json({ error: 'GROQ_KEY not configured on server.' });
+  }
+
+  try {
+    const form = new FormData();
+    const blob = new Blob([req.file.buffer], { type: req.file.mimetype || 'audio/webm' });
+    form.append('file', blob, req.file.originalname || 'audio.webm');
+    form.append('model', 'whisper-large-v3-turbo');
+    form.append('language', 'en');
+    form.append('response_format', 'json');
+
+    const response = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${GROQ_KEY}` },
+      body: form,
+    });
+
+    const data = await response.json();
+    if (!response.ok) {
+      console.error('Groq transcription error:', data);
+      return res.status(502).json({ error: data.error?.message || 'Groq transcription error.' });
+    }
+
+    res.json({ text: data.text || '' });
+  } catch (err) {
+    console.error('Transcribe error:', err);
+    res.status(500).json({ error: 'Internal server error.' });
+  }
+});
+
 // ── /summarize ────────────────────────────────────────────────────────────────
 app.post('/summarize', rateLimit, async (req, res) => {
   const transcript = req.body.transcript?.trim();
@@ -197,9 +256,13 @@ app.post('/summarize', rateLimit, async (req, res) => {
     return res.status(503).json({ error: 'GROQ_KEY not configured on server.' });
   }
   try {
-    const { data } = await axios.post(
-      'https://api.groq.com/openai/v1/chat/completions',
-      {
+    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${GROQ_KEY}`,
+      },
+      body: JSON.stringify({
         model: GROQ_MODEL,
         max_tokens: 1024,
         messages: [{
@@ -212,15 +275,13 @@ Be concise. Use bullet points under each section.
 Transcript:
 ${transcript}`,
         }],
-      },
-      {
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${GROQ_KEY}`,
-        },
-        timeout: 60_000,
-      }
-    );
+      }),
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      console.error('Groq API error:', data);
+      return res.status(502).json({ error: data.error?.message || 'Groq API error.' });
+    }
     const summary = data.choices?.[0]?.message?.content;
     if (!summary) {
       console.error('Unexpected Groq response:', data);
@@ -228,88 +289,8 @@ ${transcript}`,
     }
     res.json({ summary });
   } catch (err) {
-    const status = err.response?.status || 500;
-    const msg = err.response?.data?.error?.message || err.message || 'Internal server error.';
-    console.error('Summarize error:', status, msg, err.response?.data);
-    res.status(status >= 400 && status < 600 ? 502 : 500).json({ error: msg });
-  }
-});
-
-// ── /transcribe ───────────────────────────────────────────────────────────────
-const transcribeUpload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 25 * 1024 * 1024 }, // 25 MB (Groq Whisper limit)
-});
-
-// Simple per-IP rate limiter for transcribe
-const transcribeHits = new Map();
-function transcribeRateLimit(req, res, next) {
-  const ip = req.ip;
-  const now = Date.now();
-  const windowMs = 60_000;
-  const max = 40;
-  const entry = transcribeHits.get(ip) || { count: 0, start: now };
-  if (now - entry.start > windowMs) { entry.count = 0; entry.start = now; }
-  entry.count++;
-  transcribeHits.set(ip, entry);
-  if (entry.count > max) {
-    return res.status(429).json({ error: 'Too many transcribe requests.' });
-  }
-  next();
-}
-
-app.post('/transcribe', transcribeRateLimit, transcribeUpload.single('audio'), async (req, res) => {
-  if (!req.file) {
-    return res.status(400).json({ error: 'No audio file uploaded.' });
-  }
-  if (!GROQ_KEY) {
-    return res.status(503).json({ error: 'GROQ_KEY not configured on server.' });
-  }
-
-  try {
-    const mime = req.file.mimetype || 'audio/webm';
-    const ext =
-      mime.includes('mp4')  ? 'm4a' :
-      mime.includes('ogg')  ? 'ogg' :
-      mime.includes('wav')  ? 'wav' :
-      mime.includes('mpeg') ? 'mp3' :
-      'webm';
-
-    const form = new FormData();
-    form.append('file', req.file.buffer, {
-      filename: req.file.originalname || `chunk.${ext}`,
-      contentType: mime,
-      knownLength: req.file.buffer.length,
-    });
-    form.append('model', 'whisper-large-v3-turbo');
-    form.append('response_format', 'json');
-    form.append('temperature', '0');
-    if (req.body.language) form.append('language', req.body.language);
-
-    const { data } = await axios.post(
-      'https://api.groq.com/openai/v1/audio/transcriptions',
-      form,
-      {
-        headers: {
-          ...form.getHeaders(),
-          Authorization: `Bearer ${GROQ_KEY}`,
-        },
-        maxBodyLength: Infinity,
-        maxContentLength: Infinity,
-        timeout: 120_000,
-      }
-    );
-
-    res.json({ text: (data.text || '').trim() });
-  } catch (err) {
-    const status = err.response?.status || 500;
-    const msg =
-      err.response?.data?.error?.message ||
-      (typeof err.response?.data === 'string' ? err.response.data : null) ||
-      err.message ||
-      'Transcription failed.';
-    console.error('Transcribe error:', status, msg, err.response?.data);
-    res.status(status >= 400 && status < 600 ? 502 : 500).json({ error: msg });
+    console.error('Summarize error:', err);
+    res.status(500).json({ error: 'Internal server error.' });
   }
 });
 
@@ -318,7 +299,7 @@ app.get('/health', (_req, res) => {
   res.json({
     status: 'ok',
     groq: !!GROQ_KEY,
-    livekit: !!GROQ_KEY && LIVEKIT_API_KEY !== 'devkey',
+    livekit: !!LIVEKIT_API_KEY,
   });
 });
 

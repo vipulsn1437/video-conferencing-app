@@ -1,14 +1,15 @@
 import { useEffect, useRef, useCallback } from 'react';
 
+const SERVER = process.env.REACT_APP_SERVER_URL || 'http://localhost:5000';
+const CHUNK_MS = 4000;          // length of each recorded chunk sent for transcription
+const MIN_BLOB_BYTES = 3000;    // skip near-silent/empty chunks (saves API calls)
+
 // ── Text post-processor ───────────────────────────────────────────────────────
 function cleanText(text) {
   return text
     .trim()
-    // Capitalize first letter
     .replace(/^./, c => c.toUpperCase())
-    // Add period at end if no punctuation
     .replace(/([^.!?])$/, '$1.')
-    // Fix common speech-to-text mistakes
     .replace(/\bi\b/g, 'I')
     .replace(/\bcant\b/g, "can't")
     .replace(/\bdont\b/g, "don't")
@@ -20,9 +21,7 @@ function cleanText(text) {
     .replace(/\bim\b/g, "I'm")
     .replace(/\bive\b/g, "I've")
     .replace(/\bill\b/g, "I'll")
-    // Remove filler words (optional — comment out if you want them)
     .replace(/\b(um+|uh+|er+|ah+|hmm+)\b/gi, '')
-    // Collapse multiple spaces
     .replace(/\s{2,}/g, ' ')
     .trim();
 }
@@ -33,20 +32,37 @@ function isTooSimilar(a, b) {
   const normalize = s => s.toLowerCase().replace(/[^a-z0-9]/g, '');
   const na = normalize(a);
   const nb = normalize(b);
-  // Exact match
   if (na === nb) return true;
-  // One contains the other (repeat detection)
   if (na.includes(nb) || nb.includes(na)) return true;
   return false;
 }
 
+// ── Whisper sometimes "hallucinates" a stock phrase on near-silent audio ──────
+const HALLUCINATIONS = new Set([
+  'thank you', 'thanks for watching', 'bye', 'you', 'thank you for watching',
+]);
+
+function pickMimeType() {
+  const candidates = [
+    'audio/webm;codecs=opus',
+    'audio/webm',
+    'audio/mp4',
+    'audio/ogg;codecs=opus',
+  ];
+  for (const type of candidates) {
+    if (window.MediaRecorder && MediaRecorder.isTypeSupported(type)) return type;
+  }
+  return '';
+}
+
 const useTranscript = (username, onNewLine, onInterim, isActive) => {
-  const recognitionRef = useRef(null);
-  const isRunning      = useRef(false);
-  const restartTimer   = useRef(null);
-  const interimTimer   = useRef(null);
+  const streamRef      = useRef(null);
+  const recorderRef    = useRef(null);
+  const chunkTimer     = useRef(null);
   const isMounted      = useRef(true);
-  const lastFinalText  = useRef('');  // ← for duplicate detection
+  const isStoppingRef  = useRef(false);
+  const mimeTypeRef    = useRef('');
+  const lastFinalText  = useRef('');
 
   const onNewLineRef = useRef(onNewLine);
   const onInterimRef = useRef(onInterim);
@@ -56,153 +72,138 @@ const useTranscript = (username, onNewLine, onInterim, isActive) => {
   useEffect(() => { onInterimRef.current = onInterim; }, [onInterim]);
   useEffect(() => { usernameRef.current  = username;  }, [username]);
 
-  const clearTimers = useCallback(() => {
-    clearTimeout(restartTimer.current);
-    clearTimeout(interimTimer.current);
+  const sendChunk = useCallback(async (blob) => {
+    if (!blob || blob.size < MIN_BLOB_BYTES) return;
+
+    onInterimRef.current?.('Transcribing…');
+
+    try {
+      const ext = mimeTypeRef.current.includes('mp4') ? 'mp4'
+        : mimeTypeRef.current.includes('ogg') ? 'ogg'
+        : 'webm';
+
+      const form = new FormData();
+      form.append('audio', blob, `chunk.${ext}`);
+
+      const res = await fetch(`${SERVER}/transcribe`, {
+        method: 'POST',
+        body: form,
+      });
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || 'Transcription failed');
+      }
+
+      const data = await res.json();
+      const raw = (data.text || '').trim();
+
+      if (!isMounted.current) return;
+      onInterimRef.current?.('');
+
+      if (!raw || raw.length < 2) return;
+
+      const bare = raw.toLowerCase().replace(/[.!?]/g, '').trim();
+      if (HALLUCINATIONS.has(bare)) return;
+
+      const cleaned = cleanText(raw);
+      if (cleaned.length < 3) return;
+
+      if (isTooSimilar(cleaned, lastFinalText.current)) {
+        console.debug('Skipped duplicate:', cleaned);
+        return;
+      }
+      lastFinalText.current = cleaned;
+
+      const time = new Date().toLocaleTimeString([], {
+        hour: '2-digit',
+        minute: '2-digit',
+      });
+
+      onNewLineRef.current?.({
+        id: `${Date.now()}-${Math.random()}`,
+        speaker: usernameRef.current,
+        text: cleaned,
+        time,
+      });
+    } catch (err) {
+      if (isMounted.current) onInterimRef.current?.('');
+      console.debug('Transcription error:', err.message);
+    }
   }, []);
 
-  const clearInterim = useCallback(() => {
-    clearTimeout(interimTimer.current);
-    onInterimRef.current?.('');
-  }, []);
+  const recordNextChunk = useCallback(() => {
+    if (!isMounted.current || !streamRef.current || isStoppingRef.current) return;
 
-  useEffect(() => {
-    isMounted.current = true;
-
-    const SpeechRecognition =
-      window.SpeechRecognition || window.webkitSpeechRecognition;
-
-    if (!SpeechRecognition) {
-      console.warn('SpeechRecognition not supported.');
+    const mimeType = mimeTypeRef.current;
+    let recorder;
+    try {
+      recorder = new MediaRecorder(streamRef.current, mimeType ? { mimeType } : undefined);
+    } catch (err) {
+      console.warn('MediaRecorder init failed:', err.message);
       return;
     }
 
-    const recognition = new SpeechRecognition();
-    recognition.continuous      = true;
-    recognition.interimResults  = true;
-    recognition.maxAlternatives = 3;   // ← get top 3 alternatives for best pick
-    recognition.lang            = 'en-IN';
+    const localChunks = [];
+    recorder.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) localChunks.push(e.data);
+    };
 
-    recognitionRef.current = recognition;
+    recorder.onstop = () => {
+      const blob = new Blob(localChunks, { type: mimeType || 'audio/webm' });
+      if (!isStoppingRef.current) {
+        sendChunk(blob);
+        recordNextChunk();
+      }
+    };
 
-    const start = () => {
-      if (!isMounted.current || isRunning.current) return;
+    recorderRef.current = recorder;
+    recorder.start();
+
+    chunkTimer.current = setTimeout(() => {
+      if (recorder.state !== 'inactive') recorder.stop();
+    }, CHUNK_MS);
+  }, [sendChunk]);
+
+  useEffect(() => {
+    isMounted.current = true;
+    isStoppingRef.current = false;
+
+    async function setup() {
+      if (!isActive) return;
+      if (!navigator.mediaDevices?.getUserMedia) {
+        console.warn('getUserMedia not supported on this browser.');
+        return;
+      }
       try {
-        recognition.start();
-        isRunning.current = true;
-      } catch (e) {}
-    };
-
-    const stop = () => {
-      clearTimers();
-      clearInterim();
-      isRunning.current = false;
-      try { recognition.stop(); } catch (_) {}
-    };
-
-    const scheduleRestart = (delay = 1500) => {
-      clearTimeout(restartTimer.current);
-      restartTimer.current = setTimeout(() => {
-        if (isMounted.current && isActive) start();
-      }, delay);
-    };
-
-    recognition.onresult = (event) => {
-      let interim = '';
-      let finalText = '';
-      let bestConfidence = 0;
-
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        const result = event.results[i];
-
-        if (result.isFinal) {
-          // ── Pick the best alternative by confidence ──────────────────────
-          let bestAlt = result[0];
-          for (let j = 1; j < result.length; j++) {
-            if (result[j].confidence > bestAlt.confidence) {
-              bestAlt = result[j];
-            }
-          }
-
-          bestConfidence = bestAlt.confidence;
-
-          // ── Confidence filter: skip very low confidence results ───────────
-          // Chrome usually returns 0–1; skip if below 0.3
-          if (bestConfidence > 0 && bestConfidence < 0.3) {
-            console.debug('Skipped low-confidence result:', bestAlt.transcript, bestConfidence);
-            continue;
-          }
-
-          finalText += bestAlt.transcript;
-        } else {
-          // Show best interim alternative
-          interim += result[0].transcript;
-        }
-      }
-
-      // ── Interim display ──────────────────────────────────────────────────
-      if (interim) {
-        onInterimRef.current?.(interim);
-        clearTimeout(interimTimer.current);
-        interimTimer.current = setTimeout(clearInterim, 3000);
-      }
-
-      // ── Final result processing ──────────────────────────────────────────
-      if (finalText.trim().length > 2) {
-        const cleaned = cleanText(finalText);
-
-        // Skip empty or too-short results after cleaning
-        if (cleaned.length < 3) return;
-
-        // Skip duplicates / repeated phrases
-        if (isTooSimilar(cleaned, lastFinalText.current)) {
-          console.debug('Skipped duplicate:', cleaned);
-          clearInterim();
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        if (!isMounted.current) {
+          stream.getTracks().forEach(t => t.stop());
           return;
         }
-
-        lastFinalText.current = cleaned;
-        clearInterim();
-
-        const time = new Date().toLocaleTimeString([], {
-          hour: '2-digit',
-          minute: '2-digit',
-        });
-
-        onNewLineRef.current?.({
-          id: `${Date.now()}-${Math.random()}`,
-          speaker: usernameRef.current,
-          text: cleaned,
-          time,
-          confidence: bestConfidence, // pass along for optional UI display
-        });
+        streamRef.current = stream;
+        mimeTypeRef.current = pickMimeType();
+        recordNextChunk();
+      } catch (err) {
+        console.warn('Mic access error:', err.message);
       }
-    };
-
-    recognition.onerror = (e) => {
-      isRunning.current = false;
-      if (e.error === 'aborted' || e.error === 'not-allowed') return;
-      if (isMounted.current && isActive) {
-        scheduleRestart(e.error === 'no-speech' ? 500 : 2000);
-      }
-    };
-
-    recognition.onend = () => {
-      isRunning.current = false;
-      if (isMounted.current && isActive) scheduleRestart();
-    };
-
-    if (isActive) {
-      scheduleRestart(800);
-    } else {
-      stop();
     }
 
+    setup();
+
     return () => {
-      isMounted.current = false;
-      stop();
+      isStoppingRef.current = true;
+      clearTimeout(chunkTimer.current);
+      if (recorderRef.current && recorderRef.current.state !== 'inactive') {
+        try { recorderRef.current.stop(); } catch (_) {}
+      }
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(t => t.stop());
+        streamRef.current = null;
+      }
+      onInterimRef.current?.('');
     };
-  }, [isActive, clearInterim, clearTimers]);
+  }, [isActive, recordNextChunk]);
 };
 
 export default useTranscript;
