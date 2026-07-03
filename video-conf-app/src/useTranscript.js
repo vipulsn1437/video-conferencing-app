@@ -8,7 +8,7 @@ const MIN_BLOB_BYTES = 3000;
 const SILENCE_RMS_THRESHOLD = 0.011;
 const MIN_VOICED_RATIO = 0.18;
 const MAX_OVERLAP_WORDS = 12;
-const DEBUG_AUDIO = true; // set false once tuned — logs voiced ratio per chunk
+const DEBUG_AUDIO = false; 
 
 // ── Text post-processor ───────────────────────────────────────────────────────
 function cleanText(text) {

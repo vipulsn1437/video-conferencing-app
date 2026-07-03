@@ -40,7 +40,7 @@ const roomService = new RoomServiceClient(
 // ── Multer (in-memory, for audio chunk uploads) ───────────────────────────────
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 15 * 1024 * 1024 }, // 15MB — plenty for a few seconds of audio
+  limits: { fileSize: 15 * 1024 * 1024 }, 
 });
 
 // ── Host tracking (in-memory: room -> host UID) ───────────────────────────────
@@ -91,7 +91,7 @@ function transcribeRateLimit(req, res, next) {
   const ip  = req.ip;
   const now = Date.now();
   const windowMs = 60_000;
-  const max = 80; // dual-lane recording roughly doubles call frequency
+  const max = 80; 
   const entry = transcribeHits.get(ip) || { count: 0, start: now };
   if (now - entry.start > windowMs) {
     entry.count = 0;
@@ -105,7 +105,7 @@ function transcribeRateLimit(req, res, next) {
   next();
 }
 
-// ── Host-only guard (checks verified UID, not client-supplied name) ──────────
+// ── Host-only guard (checks verified UID) ──────────
 function requireHost(req, res, next) {
   const { room } = req.body;
   if (!room) {

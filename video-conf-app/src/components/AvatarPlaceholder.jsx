@@ -29,7 +29,7 @@ export default function AvatarPlaceholder() {
           if (!img) {
             img = document.createElement('img');
             img.className = 'lk-avatar-img';
-            img.referrerPolicy = 'no-referrer'; // Google avatar URLs often need this
+            img.referrerPolicy = 'no-referrer'; 
             img.onerror = () => {
               img.remove();
               if (svg) svg.style.display = '';
@@ -45,8 +45,7 @@ export default function AvatarPlaceholder() {
     }
 
     applyAvatars();
-    // LiveKit re-renders tiles on track/mic/state changes, which can wipe our
-    // injected <img>, so re-apply whenever the DOM changes.
+   
     const observer = new MutationObserver(applyAvatars);
     observer.observe(document.body, { childList: true, subtree: true });
     return () => observer.disconnect();
